@@ -1,0 +1,15 @@
+# Build artifacts
+build/
+bin/
+
+# Connect IQ developer signing key — never commit
+*.der
+.Garmin/
+
+# OS / editor scratch
+.DS_Store
+*.swp
+.vscode/
+
+# Internal build / orchestration artifacts (planner, agent logs, verification)
+.kimchi/

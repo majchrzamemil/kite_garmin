@@ -1,0 +1,15 @@
+# Monkey Jungle build file for Kite Jump Tracker.
+#
+# A jungle file describes which source directories to include and what
+# resources to bundle. Connect IQ projects typically have one top-level
+# jungle file plus per-project ones for tests and barrels.
+#
+# `monkeyc -f monkey.jungle` walks every entrypoint and compiles them
+# along with everything they import.
+#
+# Unit tests live in `source/test/`. Files annotated with `(:test)` are
+# only included in the build when `monkeyc --unit-test` is passed; a
+# normal `monkeyc -f monkey.jungle` build skips them.
+
+project.manifest = manifest.xml
+base.sourcePath = source

@@ -1,0 +1,16 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  Localized strings for the Kite Jump Tracker app.
+  The `@Strings.AppName` reference in manifest.xml resolves to the
+  `AppName` entry in this file. Adding a new language is a matter of
+  dropping another strings.xml into a region subdirectory.
+-->
+<strings>
+  <string id="AppName">Kite Tracker</string>
+  <string id="JumpHeightLabel">Jump Height</string>
+  <string id="JumpLengthLabel">Jump Length</string>
+  <string id="JumpAirtimeLabel">Airtime</string>
+  <string id="JumpAccelHeightLabel">Jump Height (Accel)</string>
+  <string id="MetersUnit">m</string>
+  <string id="SecondsUnit">s</string>
+</strings>
