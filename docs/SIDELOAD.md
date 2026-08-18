@@ -45,8 +45,14 @@ If you see `Use command line option: -y`, make sure the `/opt/homebrew/bin/monke
 ## 2. Connect the watch to your Mac
 
 1. Plug the watch into the Mac with Garmin's USB cable.
-2. On the watch you may see a prompt like "USB Charging Only" or "File Transfer"; choose **File Transfer / MTP** if it asks.
-3. On macOS the Instinct Solar 2 mounts as a normal FAT drive at `/Volumes/GARMIN`. The real Garmin file system is nested one level deeper at `/Volumes/GARMIN/GARMIN/`.
+2. On the watch you may see a prompt like "USB Charging Only" or
+   "File Transfer". **Choose File Transfer / MTP** — this is the
+   only mode that exposes the FAT filesystem on macOS. Without it
+   `/Volumes/GARMIN` will not mount and you will not be able to drop
+   the `.prg` on the watch.
+3. On macOS the Instinct Solar 2 mounts as a normal FAT drive at
+   `/Volumes/GARMIN`. The real Garmin file system is nested one level
+   deeper at `/Volumes/GARMIN/GARMIN/`.
 
 ### macOS MTP client: OpenMTP (optional)
 
@@ -109,17 +115,63 @@ If the app does not appear, power cycle the watch:
 
 `System.println` lines from a side-loaded app do not appear in the simulator log. They are written to a text file in the `GARMIN/Apps/LOGS/` folder with the **same base name as the `.prg`**, and the Instinct Solar 2's FAT filesystem is **case-sensitive**, so the file must be named `APP.TXT` (uppercase) to match `app.prg`.
 
-1. Create the folder `/Volumes/GARMIN/GARMIN/Apps/LOGS/` if it does not exist.
-2. Create an empty file named **`APP.TXT`** (uppercase) on your Mac and copy it into `GARMIN/Apps/LOGS/`.
-3. (Optional) Also create a lowercase `app.TXT` in the same folder as a fallback for older firmware.
-4. Run the app on the watch.
-5. If the app crashes, the watch may also create its own `APP.TXT` on first crash even if you did not pre-create one.
-6. Reconnect the watch and download `GARMIN/Apps/LOGS/APP.TXT`.
-7. Open it in a text editor. Lines prefixed with `[KITE]` come from our `Logger.mc`.
+### Log-pull workflow
 
-If neither `APP.TXT` nor `app.TXT` exists, `System.println` output is silently discarded.
+1. Make sure the watch is still in **File Transfer / MTP** mode (the
+   same mode used to side-load). If it has dropped back to charging,
+   the `/Volumes/GARMIN` mount disappears and the log file is not
+   accessible from the Mac.
+2. The pre-created `APP.TXT` (and optional lowercase `app.TXT`
+   fallback) from step 3 above should already exist at
+   `/Volumes/GARMIN/GARMIN/Apps/LOGS/`. The watch appends to the file
+   while the app runs; you do not need to re-create it between
+   sessions.
+3. Run the app on the watch and exercise it as normal.
+4. Quit the app cleanly (`BACK` from the start view) so the buffered
+   `System.println` lines are flushed. If the app crashes, the watch
+   also creates its own `APP.TXT` on first crash even if you did not
+   pre-create one.
+5. Reconnect the watch if necessary, then copy the log out:
+
+   ```bash
+   cp /Volumes/GARMIN/GARMIN/Apps/LOGS/APP.TXT ./APP.TXT
+   ```
+
+6. Open the file in a text editor. Lines prefixed with `[KITE]` come
+   from our `Logger.mc`.
+
+### What to look for
+
+- `JUMP AIRBORNE ts=… takeoffG=… baselinePa=…` — takeoff event with
+  the trigger G and pre-jump pressure.
+- `detector: landing path=…` — which of the three landing paths
+  closed the jump (`pressure`, `gps`, or `lowG`).
+- `JUMP LANDED ts=… durationMs=… heightM=… airtimeS=…
+  landingPath=…` — full jump metrics.
+- `JUMP_DUMP idx=… heightM=… landingPath=… recorded=…` — per-jump
+  row inside the `SESSION_DUMP_*` block emitted by `App.endSession`.
+- `session: jump skipped (baro=…m airtime=…s)` — landed jump that
+  failed the 1.5 m / 1 s record gate and was not written to FIT.
+- `detector: discard no pressure drop …` / `detector: timeout
+  discard no pressure drop …` — candidate rejected by the 20 Pa
+  hybrid filter gate. These are diagnostic noise, not bugs.
+
+### Case-sensitivity trap
+
+If neither `APP.TXT` nor `app.TXT` exists, `System.println` output is
+silently discarded — the SDK creates the log file lazily on the
+first write, so you must pre-create it.
 
 > **Tip:** if you only see `app.TXT` being created/updated by the watch (and not `APP.TXT`), your `System.println` output is going to a file the SDK is creating with a lowercase name. Rename your pre-created file to match what the watch uses; on Instinct Solar 2 this is uppercase.
+
+### Why the review-view logs are missing
+
+Verbose logs from `SessionReviewView` (per-scroll `nextJump` /
+`prevJump` / `onUpdate` / `onKey` lines) are intentionally stripped
+in production. When scrolling through a 20-jump session they would
+otherwise drown out the takeoff / landing / session-dump lines you
+need for diagnostics. Only the `SessionReviewView.initialize` line
+(detected vs recorded counts) survives.
 
 ---
 
@@ -170,14 +222,20 @@ Note: this also avoids the spurious "Sync Failed" message on some Instinct firmw
 
 ## Quick checklist
 
+- [ ] Watch is in **File Transfer / MTP** mode (not "USB Charging Only").
 - [ ] `monkeyc -o build/app.prg -d instinct2 -f monkey.jungle` prints `BUILD SUCCESSFUL`.
 - [ ] `build/app.prg` exists.
-- [ ] Watch is connected via USB and mounts as `/Volumes/GARMIN`.
+- [ ] Watch mounts as `/Volumes/GARMIN`.
 - [ ] `app.prg` copied to `/Volumes/GARMIN/GARMIN/Apps/`.
-- [ ] `APP.TXT` created in `/Volumes/GARMIN/GARMIN/Apps/LOGS/` (uppercase; watch FAT is case-sensitive).
+- [ ] `APP.TXT` (uppercase; watch FAT is case-sensitive) and the
+      lowercase `app.TXT` fallback both exist in
+      `/Volumes/GARMIN/GARMIN/Apps/LOGS/`.
 - [ ] Watch ejected safely.
 - [ ] App appears in the activities list after pressing **START**.
 - [ ] App launches without showing **"IQ!"**.
+- [ ] To pull logs: reconnect, copy
+      `/Volumes/GARMIN/GARMIN/Apps/LOGS/APP.TXT`, look for `JUMP
+      AIRBORNE` / `JUMP LANDED` / `SESSION_DUMP_*` lines.
 
 ## Publishing to Connect IQ Store (Beta)
 

@@ -23,6 +23,7 @@ import Toybox.Lang;
 import Toybox.Position;
 import Toybox.Sensor;
 import Toybox.System;
+import Toybox.Time;
 import Toybox.Timer;
 import Toybox.WatchUi;
 
@@ -38,6 +39,8 @@ class App extends Application.AppBase {
     var _sessionView as SessionView?;
     var _totalAirtimeMs as Number;
     var _pendingJump as Dictionary?;
+    var _sessionJumps as Array<Dictionary>;
+    var _sessionStartMs as Number;
 
     function initialize() {
         AppBase.initialize();
@@ -51,6 +54,8 @@ class App extends Application.AppBase {
         _sessionView = null;
         _totalAirtimeMs = 0;
         _pendingJump = null;
+        _sessionJumps = [] as Array<Dictionary>;
+        _sessionStartMs = 0;
         Logger.info("App.initialize: done");
     }
 
@@ -227,8 +232,22 @@ class App extends Application.AppBase {
             return;
         }
         Logger.info("App._checkForLandedJump: before addJumpLap");
-        _sessionManager.addJumpLap(jump);
-        Logger.info("App._checkForLandedJump: after addJumpLap");
+        var recorded = _sessionManager.addJumpLap(jump);
+        Logger.info("App._checkForLandedJump: after addJumpLap (recorded=" + recorded + ")");
+        if (!recorded) {
+            // SessionManager filtered this jump (e.g. baro heightM <= 1.5m
+            // threshold). Skip all per-jump UI bookkeeping and never push
+            // SummaryView, since this jump was rejected as invalid.
+            Logger.info("ui: jump filtered (heightM=" + jump[:heightM] + "m), not showing popup");
+            return;
+        }
+
+        // Track every recorded jump for the session-end dump. The
+        // detector creates a fresh Dictionary per landing, so storing the
+        // reference here is safe even if a new jump later overwrites
+        // _detector._lastJump.
+        jump[:recorded] = recorded;
+        _sessionJumps.add(jump);
 
         // Accumulate airtime for the DoneView summary.
         var duration = jump.get(:durationMs);
@@ -303,6 +322,16 @@ class App extends Application.AppBase {
         _totalAirtimeMs = 0;
         // Clear any leftover pending jump from a previous session.
         _pendingJump = null;
+        // Reset the session-scoped jump log and stamp the start time.
+        // The list is cleared here (not just at endSession) so a
+        // begin/abort/abort/begin cycle never accumulates stale jumps.
+        _sessionJumps = [] as Array<Dictionary>;
+        _sessionStartMs = System.getTimer();
+        // Clear any persisted "last session" from a previous run so a
+        // future in-app "Last Session" view never shows stale data
+        // while a new session is in progress.
+        Application.Storage.deleteValue("kite_last_session");
+        Logger.info("App.beginSession: sessionStartMs=" + _sessionStartMs + " storage=kite_last_session cleared");
         // Switch to SessionView BEFORE starting sensors so the UI
         // thread has settled before accelerometer/GPS callbacks can
         // fire. This avoids the "IQ!" race observed in the field.
@@ -332,14 +361,21 @@ class App extends Application.AppBase {
         _sessionView = null;
         _pendingJump = null;
         var airtimeS = (_totalAirtimeMs.toFloat()) / 1000.0;
-        Logger.info("App.endSession: before switchToView(DoneView)");
+        // Dump the full session log block (and write the storage
+        // backup) before switching to DoneView so the user sees the
+        // summary while the log is already on disk.
+        Logger.info("App.endSession: before _dumpSession");
+        _dumpSession();
+        Logger.info("App.endSession: after _dumpSession");
+        Logger.info("App.endSession: before switchToView(SessionReviewView)");
+        var reviewView = new SessionReviewView(_sessionJumps, airtimeS, jumps);
         WatchUi.switchToView(
-            new DoneView(jumps, airtimeS),
-            _inputDelegate,
+            reviewView,
+            new SessionReviewInputDelegate(reviewView),
             WatchUi.SLIDE_IMMEDIATE
         );
         Logger.info("App.endSession: after switchToView");
-        Logger.info("endSession: switched to DoneView (jumps=" + jumps + " airtimeS=" + airtimeS.format("%.2f") + ")");
+        Logger.info("endSession: switched to SessionReviewView (jumps=" + jumps + " airtimeS=" + airtimeS.format("%.2f") + ")");
     }
 
     function isRecording() as Boolean {
@@ -347,6 +383,155 @@ class App extends Application.AppBase {
         Logger.info("App.isRecording: returning " + r);
         return r;
     }
+
+    // ------------------------------------------------------------------
+    // _dumpSession
+    //
+    // Emits a contiguous [KITE] SESSION_DUMP_START ... SESSION_DUMP_END
+    // block to the log so every jump detected during the session can
+    // be copied out of GARMIN/Apps/LOGS/APP.TXT and parsed offline.
+    //
+    // The log is the single source of truth for per-jump detail. The
+    // previous Application.Storage backup under "kite_last_session" was
+    // removed: side-loaded .prg builds cannot reliably write to
+    // Storage, and the failure surfaced as a noisy ERROR line that
+    // obscured real diagnostics.
+    // ------------------------------------------------------------------
+
+    function _dumpSession() as Void {
+        Logger.info("App._dumpSession: entered (jumpCount=" + _sessionJumps.size() + ")");
+
+        // Wall-clock seconds for the dump header. Use Time.now().value()
+        // (seconds since 1970) so a downstream reader can correlate the
+        // log with calendar time.
+        var wallClockS = 0;
+        if (Toybox has :Time) {
+            var now = Time.now();
+            if (now != null) {
+                wallClockS = now.value();
+            }
+        }
+
+        var sessionDurationMs = 0;
+        if (_sessionStartMs > 0) {
+            var nowMs = System.getTimer();
+            if (nowMs >= _sessionStartMs) {
+                sessionDurationMs = nowMs - _sessionStartMs;
+            }
+        }
+
+        // Record the detector's final state at end of session. If we
+        // ended while still AIRBORNE the jump was never closed (no
+        // landing path fired, possibly within the 30 s safety window);
+        // this line makes that visible in the log without having to
+        // scroll through JUMP AIRBORNE entries.
+        Logger.info(
+            "App._dumpSession: stateAtEnd=" + _detector.getStateName()
+            + " recordedJumps=" + _sessionManager.getJumpCount()
+        );
+
+        Logger.info(
+            "SESSION_DUMP_START"
+            + " id=" + _sessionStartMs
+            + " wallClockS=" + wallClockS
+            + " jumpCount=" + _sessionJumps.size()
+        );
+
+        var recordedCount = 0;
+        var totalAirtimeMs = 0;
+
+        var i = 0;
+        while (i < _sessionJumps.size()) {
+            var j = _sessionJumps[i];
+
+            // Look up each field defensively so a half-populated jump
+            // (e.g. GPS never fixed, so lengthM is 0) still produces
+            // a valid dump line.
+            var startTs      = j.get(:startTs);
+            var endTs        = j.get(:endTs);
+            var durationMs   = j.get(:durationMs);
+            var heightM      = j.get(:heightM);
+            var lengthM      = j.get(:lengthM);
+            var airtimeS     = j.get(:airtimeS);
+            var peakDeltaPa      = j.get(:peakDeltaPa);
+            var recorded         = j.get(:recorded);
+            var landingPathCode  = j.get(:landingPathCode);
+            if (startTs          == null) { startTs          = 0; }
+            if (endTs            == null) { endTs            = 0; }
+            if (durationMs       == null) { durationMs       = 0; }
+            if (heightM          == null) { heightM          = 0; }
+            if (lengthM          == null) { lengthM          = 0; }
+            if (airtimeS         == null) { airtimeS         = 0.0f; }
+            if (peakDeltaPa      == null) { peakDeltaPa      = 0; }
+            if (recorded         == null) { recorded         = false; }
+            if (landingPathCode  == null) { landingPathCode  = -1; }
+
+            // The dictionary stores the landing path as a numeric code
+            // (see JumpDetector._landingPathToCode). Translate back to a
+            // human-readable string for the log line. Keep this mapping
+            // identical to the one in SessionReviewView so the two
+            // surfaces always show the same label. Dictionary.get()
+            // returns Lang.Object?, so we compare via .equals() rather
+            // than treating the value as a Number directly.
+            var landingPath = _codeToLandingPath(
+                landingPathCode.equals(0) ? 0 :
+                landingPathCode.equals(1) ? 1 :
+                landingPathCode.equals(2) ? 2 :
+                landingPathCode.equals(3) ? 3 : -1
+            );
+
+            var isRecorded = false;
+            if (recorded) { isRecorded = true; }
+            if (isRecorded) {
+                recordedCount++;
+            }
+            // Sum airtime from the raw duration so we are immune to
+            // any rounding in airtimeS.
+            totalAirtimeMs += durationMs.toNumber();
+
+            // recorded is a Boolean; render it as a 1/0 numeric token
+            // for the log so the line stays strictly numeric except for
+            // the human-readable landingPath label.
+            var recordedNum = isRecorded ? 1 : 0;
+
+            Logger.info(
+                "JUMP_DUMP"
+                + " idx=" + i
+                + " startTs=" + startTs
+                + " endTs=" + endTs
+                + " durationMs=" + durationMs
+                + " heightM=" + heightM.toFloat().format("%.2f")
+                + " lengthM=" + lengthM.toFloat().format("%.2f")
+                + " airtimeS=" + airtimeS.toFloat().format("%.2f")
+                + " peakDeltaPa=" + peakDeltaPa.toFloat().format("%.1f")
+                + " landingPath=" + landingPath
+                + " landingPathCode=" + landingPathCode
+                + " recorded=" + recordedNum
+            );
+            i++;
+        }
+
+        var totalAirtimeS = totalAirtimeMs.toFloat() / 1000.0;
+        Logger.info(
+            "SESSION_DUMP_END"
+            + " totalJumps=" + _sessionJumps.size()
+            + " recordedJumps=" + recordedCount
+            + " totalAirtimeS=" + totalAirtimeS.format("%.2f")
+            + " sessionDurationMs=" + sessionDurationMs
+        );
+    }
+}
+
+// Translate a JumpDetector landing-path code back to a human-readable
+// string for logging and on-screen display. Must stay in lock-step
+// with JumpDetector._landingPathToCode(): 0="pressure", 1="gps",
+// 2="lowG", 3="timeout", -1 (and anything else)="unknown".
+function _codeToLandingPath(code as Number) as String {
+    if (code == 0) { return "pressure"; }
+    if (code == 1) { return "gps"; }
+    if (code == 2) { return "lowG"; }
+    if (code == 3) { return "timeout"; }
+    return "unknown";
 }
 
 // The simplest possible Connect IQ view: paint a centered "Hello" string.

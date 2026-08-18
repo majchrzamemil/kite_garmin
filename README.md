@@ -2,80 +2,225 @@
 
 Garmin Connect IQ watch app for the **Instinct Solar 2** that records
 kite jumps from the on-wrist accelerometer, barometer, and GPS.
+**Validated end-to-end on a real Instinct Solar 2.**
 
 ## What it does
 
 - Press **START** on the watchface, launch **Kite Tracker**, press
   **START** again to begin a session.
-- The app detects jumps automatically from the sensor stream:
-  **accelerometer** (G-threshold takeoff, freefall confirmation,
-  G-threshold landing), corroborated by **pressure** returning to
-  baseline OR **GPS speed** dropping below 1.5 m/s.
-- After each landing, a 2x2 grid shows the barometric height (BH),
-  the accelerometer height (AH), the airtime (T), and the jump
-  length (L).
-- Press **START** to end the session. The FIT activity syncs to
-  Garmin Connect and each jump appears as a lap with four custom
-  fields: jump height (baro), jump height (accel), jump length,
-  airtime.
+- The app detects jumps automatically from the sensor stream using a
+  **hybrid filter**: an accelerometer takeoff spike (≥ 1.10 G total-G
+  for ~120 ms) starts an airborne window, and a barometric pressure
+  drop (≥ 20 Pa from the pre-jump baseline within the first second)
+  confirms it was a real altitude change. Sub-1-second events and
+  candidates with no altitude change are discarded.
+- Landing is detected by **three independent paths** in priority order:
+  barometric pressure returns to baseline **and** the descent rate
+  flattens (preferred), GPS speed drops below 1.5 m/s for 500 ms
+  (backup), or a low-G impact spike + freefall confirmation
+  (legacy, requires pressure or GPS corroboration). A 30 s
+  `MAX_FLIGHT_MS` watchdog force-lands the jump if nothing else
+  closes it.
+- After each landing, `SessionManager.addJumpLap` checks the
+  barometric height against a 1.5 m gate and the airtime against a
+  1 s gate; jumps that pass are written as a FIT lap and trigger a
+  short `SummaryView` popup showing a large centred height with the
+  proper `m` suffix.
+- Press **START** to end the session. The `SessionReviewView` lists
+  every recorded jump one per screen; UP/DOWN scrolls the list,
+  BACK exits. The FIT activity syncs to Garmin Connect and each jump
+  appears as a lap with the custom lap fields declared in
+  `resources/fitcontributions/fitcontributions.xml`.
 
-## Sensors
+## How it works
+
+### Sensors
 
 | Sensor | Source | Rate |
 |--------|--------|------|
-| Accelerometer | `Sensor.getInfo().accel` | polled at 25 Hz (every 40 ms) |
-| Barometric pressure | `Activity.getActivityInfo().rawAmbientPressure` | polled at 1 Hz |
+| Accelerometer | `Sensor.getInfo().accel` | polled via `Timer` at 40 Hz |
+| Barometric pressure | `Activity.getActivityInfo().rawAmbientPressure` | polled via `Timer` at 1 Hz |
 | GPS position + speed | `Position.enableLocationEvents(LOCATION_CONTINUOUS)` | ~1 Hz |
 
 Note: `Sensor.getInfo().pressure` is MSL-calibrated and was rejected.
 The raw ambient pressure from the activity session is what we want
 because it changes with altitude (~12 Pa / metre).
 
-## Height calculations
+`Sensor.registerSensorDataListener` (API 2.3.0) crashes on Connect IQ
+6.0.2 devices including the Instinct Solar 2, so the accelerometer
+runs on the legacy `Sensor.getInfo()` poll loop instead.
 
-For every detected jump we compute three independent estimates and
-store them all in the FIT file so we can compare them later.
+### Algorithm — hybrid jump detection
 
-- **BH (barometric)** — ICAO formula on `_minPressure` (lowest Pa
-  during flight) vs the takeoff baseline:
-  `h = 44330 * (1 - (P / P0)^0.190263)` metres. Most accurate
-  on a stationary wrist, less noisy at 1 Hz.
-- **AH (accelerometer)** — split airtime into ascent and descent
-  using `_peakTs` (timestamp of the pressure minimum = peak altitude).
-  Each phase is half a free-fall:
-  `h_ascent = g · t_ascent² / 2`, `h_descent = g · t_descent² / 2`,
-  `AH = (h_ascent + h_descent) / 2`. Velocity-independent (works even
-  when the rider jumps with non-zero initial velocity).
-- **L (length)** — Haversine distance between takeoff and landing
-  positions. Optional reference, mostly there for the screen and
-  for the FIT file.
-- **T (airtime)** — landing timestamp minus takeoff timestamp.
+A jump is recognised in three stages.
 
-Jumps where BH <= 1 m **and** AH <= 1 m are filtered out (real
-jumps are taller; sub-1 m readings are usually false positives like
-button presses or wrist flicks).
+1. **Takeoff (`STATE_ARMED` → `STATE_AIRBORNE`).** Three consecutive
+   accelerometer samples whose total-G magnitude meets or exceeds
+   `TAKEOFF_G = 1.10` (~120 ms at 25 Hz effective rate). Lowered
+   from the original 1.25 after field tests showed soft kite
+   launches never spike above ~1.2 G.
+2. **Pre-landing gate (`_maybeLand`, must pass before any landing
+   path fires).**
+   - Airborne for at least `MIN_FLIGHT_MS = 1000` ms. Sub-second
+     events (wind gusts, bar yanks, wrist impacts) are discarded.
+   - Pressure has dropped by at least `TAKEOFF_PRESSURE_DROP_PA = 20`
+     Pa from the pre-jump baseline (~1.7 m of climb). Sustained
+     low-G windows without altitude change are discarded by
+     `_discardJump`.
+3. **Landing.** Three paths in priority order:
+   - **Pressure (preferred).** `|P_current - P_baseline| <= PRESSURE_RETURN_PA` (20 Pa)
+     AND `|descentRate| <= DESCENT_FLAT_PA_S` (5 Pa/s) — descent
+     rate is computed by `_descentRatePaS` over a 4-sample pressure
+     ring buffer.
+   - **GPS speed (backup).** Ground speed below `GPS_SPEED_LOW_MPS = 1.5` m/s
+     for at least `GPS_LOW_FOR_LAND_MS = 500` ms.
+   - **Low-G impact (legacy + corroboration).** Three consecutive
+     samples below `LANDING_G = 1.15`, freefall confirmed mid-flight
+     (`_freefallConfirmed`), AND corroboration from pressure or GPS.
+4. **Watchdog (`tick`).** If the detector is still `AIRBORNE` after
+   `MAX_FLIGHT_MS = 30000` ms, `_forceLanding("maxFlightMs")` fires.
+   The 20 Pa pressure-drop gate applies here too — a 30 s hang
+   without altitude change is discarded.
 
-## Jump-detection thresholds
+### Record gate (`SessionManager.addJumpLap`)
 
-| Constant | Value | Source |
-|----------|-------|--------|
-| `TAKEOFF_G` | 1.25 G | lower than typical — slow kite launches don't spike above 2 G |
-| `LANDING_G` | 1.15 G | close to 1 G (freefall) but permissive |
-| `TAKEOFF_SAMPLES` | 3 | sustained spike, ~120 ms at 25 Hz |
-| `LANDING_SAMPLES` | 3 | sustained low-G, ~120 ms |
-| `FREEFALL_G` | 1.05 G | mid-flight low-G confirmation |
-| `FREEFALL_SAMPLES` | 1 | a single sample is enough — kite jumps rarely have sustained freefall on the wrist |
-| `COAST_MS` | 1500 ms | debounce between consecutive jumps |
+Both must hold for a landed jump to be written as a FIT lap:
 
-## Quick build
+- `baroH > 1.5` m.
+- `airtimeS > 1.0` s.
+
+Jumps failing either are logged but never reach the FIT file and
+never trigger `SummaryView`.
+
+### Height
+
+Barometer-only. `h = 44330 * (1 - (P_min / P_0)^0.190263)` on the
+lowest Pa observed during flight vs the takeoff baseline (ICAO
+formula). The accelerometer-derived ascent/descent height that the
+project originally produced is no longer used — wrist motion during
+riding made the half-freefall estimate too noisy on real data.
+`_accelField` is still created in the FIT session for layout
+compatibility but is hardcoded to `0.0f`.
+
+### Jump-detection constants
+
+| Constant | Value | Notes |
+|----------|-------|-------|
+| `TAKEOFF_G` | **1.10** | Soft over-correction; sub-1 m jumps are filtered by `SessionManager`. |
+| `LANDING_G` | 1.15 | Close to 1 G (freefall) but permissive. |
+| `TAKEOFF_SAMPLES` | 3 | Sustained spike, ~120 ms at 25 Hz. |
+| `LANDING_SAMPLES` | 3 | Sustained low-G, ~120 ms. |
+| `FREEFALL_G` | 1.05 | Mid-flight low-G confirmation. |
+| `FREEFALL_SAMPLES` | 1 | A single sample is enough. |
+| `MIN_FLIGHT_MS` | **1000** | No landing path may fire before 1 s. |
+| `TAKEOFF_PRESSURE_DROP_PA` | **20** | Required Pa drop after 1 s or the jump is discarded. |
+| `PRESSURE_RETURN_PA` | 20 | Pressure-return window for the pressure landing path. |
+| `DESCENT_FLAT_PA_S` | 5 | Maximum descent rate (Pa/s) for the pressure landing path. |
+| `GPS_SPEED_LOW_MPS` | 1.5 | GPS landing speed threshold. |
+| `GPS_LOW_FOR_LAND_MS` | 500 | GPS-low dwell required before the GPS path fires. |
+| `MAX_FLIGHT_MS` | **30000** | AIRBORNE watchdog. |
+| `COAST_MS` | 1500 | Debounce between consecutive jumps. |
+
+The final 1.5 m / 1 s record gate in `SessionManager.addJumpLap` is
+the third line of defence (after the two detector-side gates).
+
+## Building
+
+```bash
+cd /Users/em/Documents/repos/kite_garmin
+./build.sh
+```
+
+`build.sh` invokes `monkeyc -y ~/.Garmin/connect_iq_dev_key.der
+-o build/app.prg -d instinct2 -f monkey.jungle` and writes
+`build/app.prg`. Equivalent one-liner:
 
 ```bash
 monkeyc -o build/app.prg -d instinct2 -f monkey.jungle
 ```
 
-See [`docs/SIDELOAD.md`](docs/SIDELOAD.md) for installing on the watch
-and [`docs/TESTING.md`](docs/TESTING.md) for running the simulator
-and unit tests.
+Expected output: `BUILD SUCCESSFUL`. See
+[`docs/SIDELOAD.md`](docs/SIDELOAD.md) for installing on the watch.
+
+For the unit-test build add `--unit-test`:
+
+```bash
+monkeyc -y ~/.Garmin/connect_iq_dev_key.der \
+         -o build/test.prg \
+         -d instinct2 \
+         -f monkey.jungle \
+         --unit-test
+```
+
+See [`docs/TESTING.md`](docs/TESTING.md) for the simulator and unit
+test workflow.
+
+## Installing
+
+The build artifact is `build/app.prg`. On the Instinct Solar 2 the
+correct side-load path is `/Volumes/GARMIN/GARMIN/Apps/` (the
+top-level `/Volumes/GARMIN/Apps/` folder is ignored by the watch).
+The watch must be in **File Transfer / MTP** mode for macOS to
+mount it as a drive; if it does not mount, use [OpenMTP](https://openmtp.ganeshrvel.com/).
+
+Full step-by-step (including the OpenMTP fallback, the `APP.TXT`
+log-pull workflow, and the case-sensitivity trap) lives in
+[`docs/SIDELOAD.md`](docs/SIDELOAD.md).
+
+## Log pulling
+
+On the device, `System.println` from a side-loaded app is written to
+a file in `GARMIN/Apps/LOGS/` with the **same base name** as the
+`.prg`, in **uppercase** (the Instinct Solar 2's FAT filesystem is
+case-sensitive):
+
+```
+/Volumes/GARMIN/GARMIN/Apps/LOGS/APP.TXT
+```
+
+The project pre-creates both `APP.TXT` and a lowercase `app.TXT`
+fallback when side-loading; whichever the watch writes to is the
+file to pull. Lines prefixed with `[KITE]` come from `Logger.mc`.
+Verbose logs from `SessionReviewView` are intentionally stripped so
+the detection lines (`JUMP AIRBORNE`, `detector: landing path=...`,
+`JUMP LANDED`, `SESSION_DUMP_*`) stay readable when scrolling
+through a 20-jump session.
+
+## Testing
+
+Unit tests live in `source/test/`. Each `(:test)`-annotated function
+is compiled only by the `--unit-test` build:
+
+```bash
+monkeyc -y ~/.Garmin/connect_iq_dev_key.der \
+         -o build/test.prg \
+         -d instinct2 \
+         -f monkey.jungle \
+         --unit-test
+open -a ConnectIQ
+monkeydo build/test.prg instinct2 -t
+```
+
+The full suite covers `SensorAggregator` ring-buffer behaviour and
+the `JumpDetector` state machine, including the multi-jump regression
+tests added after the real-watch crash on the second jump of a
+session. See [`docs/TESTING.md`](docs/TESTING.md) for the simulator
+caveats and the real-watch testing workflow.
+
+> The Connect IQ simulator hangs on launch in this development
+> environment; `--unit-test` builds succeed but `monkeydo -t` cannot
+> be executed here. See `docs/TESTING.md` for the simulator caveats
+> and known pre-existing test failures.
+
+## Device support
+
+| Field | Value |
+|-------|-------|
+| Target device | Garmin Instinct Solar 2 |
+| Connect IQ product id | `instinct2` |
+| Min API level | 3.0.0 |
+| Manifest | `manifest.xml` (single product) |
+| Build key | `~/.Garmin/connect_iq_dev_key.der` |
 
 ## Project layout
 
@@ -89,14 +234,16 @@ resources/
   strings/                # app name + labels
 source/
   App.mc                  # entry point, sensor pipeline, session lifecycle
+  AppInputDelegate.mc     # START / ENTER toggle
   SessionManager.mc       # ActivityRecording + FitContributor fields, FIT export
-  JumpDetector.mc         # state machine: ARMED -> AIRBORNE -> LANDING -> COASTING
+  JumpDetector.mc         # state machine: IDLE -> ARMED -> AIRBORNE -> LANDING -> COASTING
   SensorAggregator.mc     # ring buffers for accel / pressure / GPS samples
   StartView.mc            # "Press START to begin"
   SessionView.mc          # "Recording... Jumps: N"
-  DoneView.mc             # "Session saved"
-  SummaryView.mc          # 2x2 grid AH / BH / T / L after each jump
-  AppInputDelegate.mc     # START / ENTER toggle
+  SummaryView.mc          # big centred height popup after each recorded jump
+  SessionReviewView.mc    # end-of-session scrollable review (UP/DOWN)
+  SessionReviewInputDelegate.mc
+  DoneView.mc             # superseded by SessionReviewView (kept for now)
   Logger.mc               # [KITE] prefix wrapper around System.println
   test/
     SensorAggregatorTests.mc
@@ -105,19 +252,30 @@ docs/
   ENVIRONMENT.md          # macOS dev setup: Java, SDK, signing key
   SIDELOAD.md             # side-load to a real Instinct Solar 2
   TESTING.md              # simulator + unit-test workflow
+.kimchi/
+  docs/
+    CHANGELOG.md          # version-by-version summary of shipped behaviour
+    baro-only-jump-algorithm-review.md
+    barometric-landing-fix-plan.md
+    crash-fix-plan.md
+    jump-detection-threshold-plan.md
+    session-review-view-plan.md
+    verification.md
+    ... (research notes, prior plans)
 ```
 
 ## Notes
 
 - **Custom FIT lap fields require a Connect IQ Store install.** The
-  beta workflow (see `docs/SIDELOAD.md`) is the only way to make the
-  custom columns visible in Garmin Connect mobile and web. A
-  side-loaded `.prg` writes valid data to the FIT file (download
-  with FITCSVTool to inspect it) but Connect won't render the
-  columns because the rendering metadata lives in the app-store
-  JSON, not in the `.prg`.
+  beta workflow (see `docs/SIDELOAD.md` § Publishing to Connect IQ
+  Store) is the only way to make the custom columns visible in
+  Garmin Connect mobile and web. A side-loaded `.prg` writes valid
+  data to the FIT file (download with FITCSVTool to inspect it) but
+  Connect won't render the columns because the rendering metadata
+  lives in the app-store JSON, not in the `.prg`.
 - **First-detected peaks may underestimate barometric height.** The
   pressure sensor is polled at 1 Hz. For a fast jump (apex in less
   than a second), we may sample the pressure only before and after
-  the peak and lose ~12 Pa / m of accuracy. The accelerometer
-  height is a useful cross-check in that case.
+  the peak and lose ~12 Pa / m of accuracy. The 1.5 m record gate
+  catches most of these cases by rejecting jumps whose peak pressure
+  delta does not produce a clear height above baseline.

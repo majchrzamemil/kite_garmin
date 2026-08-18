@@ -18,16 +18,13 @@ class SummaryView extends WatchUi.View {
     function initialize(jump as Dictionary) {
         var endTs = jump[:endTs];
         var heightM = jump.get(:heightM);
-        var heightAccelM = jump.get(:heightAccelM);
         var duration = jump.get(:durationMs);
-        if (heightM      == null) { heightM      = 0; }
-        if (heightAccelM == null) { heightAccelM = 0; }
-        if (duration     == null) { duration     = 0; }
+        if (heightM  == null) { heightM  = 0; }
+        if (duration == null) { duration = 0; }
         Logger.info(
             "SummaryView.initialize: entered"
             + " endTs=" + endTs
             + " heightM=" + heightM.toFloat().format("%.1f")
-            + " heightAccelM=" + heightAccelM.toFloat().format("%.1f")
             + " durationMs=" + duration
         );
         View.initialize();
@@ -60,30 +57,58 @@ class SummaryView extends WatchUi.View {
         dc.setColor(Graphics.COLOR_BLACK, Graphics.COLOR_BLACK);
         dc.clear();
 
-        var ah = _jump.get(:heightAccelM);
         var bh = _jump.get(:heightM);
         var t  = _jump.get(:durationMs);
         var l  = _jump.get(:lengthM);
-        if (ah == null) { ah = 0; }
         if (bh == null) { bh = 0; }
         if (t  == null) { t  = 0; }
         if (l  == null) { l  = 0; }
 
         var durationS = t.toFloat() / 1000.0;
 
-        // Layout: single horizontal line of all four metrics, well clear
-        // of the Instinct Solar 2 bezel cutout.
         var w = dc.getWidth();
         var h = dc.getHeight();
         var cx = w / 2;
-        var cy = h / 2;
 
-        var txt = "AH " + ah.toFloat().format("%.1f")
-            + " BH " + bh.toFloat().format("%.1f")
-            + " T " + durationS.format("%.1f") + "s"
-            + " L " + l.toFloat().format("%.1f") + "m";
+        // Instinct Solar 2 safe area: avoid the top-right circular
+        // bezel/button cutout. Keep everything centered in the middle
+        // of the screen.
+        var margin = 18;
+        var safeBottom = h - margin;
 
         dc.setColor(Graphics.COLOR_WHITE, Graphics.COLOR_TRANSPARENT);
-        dc.drawText(cx, cy, Graphics.FONT_TINY, txt, Graphics.TEXT_JUSTIFY_CENTER);
+
+        // Big centered height: e.g. "4.2m". FONT_NUMBER_MEDIUM only
+        // contains glyphs for digits, so the "m" renders as a box/X.
+        // Use FONT_LARGE instead — it supports letters and is still
+        // large enough to read at a glance.
+        var bigH = dc.getFontHeight(Graphics.FONT_LARGE);
+        var heightY = (h - bigH) / 2 - 6;
+        dc.drawText(cx, heightY, Graphics.FONT_LARGE,
+            bh.toFloat().format("%.1f") + "m",
+            Graphics.TEXT_JUSTIFY_CENTER);
+
+        // Time + travel below the height, small and unlabeled.
+        var smallH = dc.getFontHeight(Graphics.FONT_SMALL);
+        var detailY = heightY + bigH + 4;
+        var detail = durationS.format("%.1f") + "s  " + l.toFloat().format("%.1f") + "m";
+        dc.drawText(cx, detailY, Graphics.FONT_SMALL,
+            detail,
+            Graphics.TEXT_JUSTIFY_CENTER);
+
+        // Keep drawing inside safe vertical bounds; if the detail
+        // would clip, nudge it upward slightly.
+        if (detailY + smallH > safeBottom) {
+            detailY = safeBottom - smallH;
+            dc.setColor(Graphics.COLOR_BLACK, Graphics.COLOR_BLACK);
+            dc.clear();
+            dc.setColor(Graphics.COLOR_WHITE, Graphics.COLOR_TRANSPARENT);
+            dc.drawText(cx, heightY, Graphics.FONT_LARGE,
+                bh.toFloat().format("%.1f") + "m",
+                Graphics.TEXT_JUSTIFY_CENTER);
+            dc.drawText(cx, detailY, Graphics.FONT_SMALL,
+                detail,
+                Graphics.TEXT_JUSTIFY_CENTER);
+        }
     }
 }

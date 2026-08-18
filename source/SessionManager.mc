@@ -244,30 +244,28 @@ class SessionManager {
         var heightM    = jump.get(:heightM);
         var lengthM    = jump.get(:lengthM);
         var duration   = jump.get(:durationMs);
-        var accelH_raw = jump.get(:heightAccelM);
         if (heightM    == null) { heightM    = 0; }
         if (lengthM    == null) { lengthM    = 0; }
         if (duration   == null) { duration   = 0; }
-        if (accelH_raw == null) { accelH_raw = 0; }
 
         var baroH  = heightM.toFloat();
-        var accelH = accelH_raw.toFloat();
 
-        // Skip only if BOTH height estimates are <= 1m. If either the
-        // barometric or accelerometer-derived height exceeds 1m, the
-        // jump is real enough to record. Raw values are written to the
-        // FIT file so the user can compare both estimates in Garmin
-        // Connect.
-        if (baroH <= 1.0 && accelH <= 1.0) {
-            Logger.info("session: jump skipped (baro=" + baroH.format("%.1f") + "m accel=" + accelH.format("%.1f") + "m, both below 1m threshold)");
+        // Two-part filter. The barometric check rejects jumps whose
+        // peak altitude never reaches 1.5 m above the takeoff baseline.
+        // The airtime check is a backup for the detector's
+        // MIN_FLIGHT_MS gate: if for any reason a sub-1-second jump
+        // reaches addJumpLap (e.g. a future code path bypasses the
+        // detector's _maybeLand guard) we still refuse to record it as
+        // a FIT lap. The matching detector-side check is the
+        // MIN_FLIGHT_MS early return in JumpDetector._maybeLand().
+        var airtimeS = duration.toFloat() / 1000.0;
+        if (baroH <= 1.5 || airtimeS <= 1.0) {
+            Logger.info("session: jump skipped (baro=" + baroH.format("%.1f") + "m airtime=" + airtimeS.format("%.2f") + "s)");
             return false;
         }
-
-        var airtimeS = duration.toFloat() / 1000.0;
         Logger.info(
             "SessionManager.addJumpLap: values"
             + " heightM=" + baroH.format("%.1f")
-            + " accelM=" + accelH.format("%.1f")
             + " lengthM=" + lengthM.toFloat().format("%.1f")
             + " airtimeS=" + airtimeS.format("%.2f")
         );
@@ -276,7 +274,7 @@ class SessionManager {
         _heightField.setData(baroH);
         _lengthField.setData(lengthM.toFloat());
         _airtimeField.setData(airtimeS);
-        _accelField.setData(accelH);
+        _accelField.setData(0.0f);
         Logger.info("SessionManager.addJumpLap: after setData");
 
         Logger.info("SessionManager.addJumpLap: before addLap()");
@@ -287,7 +285,6 @@ class SessionManager {
             Logger.info(
                 "session: lap added (count=" + _jumpCount
                 + " heightM=" + baroH.format("%.1f")
-                + " accelM=" + accelH.format("%.1f")
                 + " lengthM=" + lengthM.toFloat().format("%.1f")
                 + " airtimeS=" + airtimeS.format("%.2f") + ")"
             );
