@@ -250,6 +250,19 @@ class SessionManager {
 
         var baroH  = heightM.toFloat();
 
+        // Upper-bound sanity discard. A barometric height above 20 m
+        // or a takeoff-to-landing distance above 100 m cannot be a
+        // realistic kiteboarding jump on the wrist-mounted sensor.
+        // Such values usually mean the median-filtered _minPressure
+        // path (or a future path) produced a corrupt altitude, or the
+        // rider covered a long stretch of water without an actual
+        // jump. Drop the row instead of polluting the FIT file.
+        if (baroH > 20.0 || lengthM.toFloat() > 100.0) {
+            Logger.info("session: jump skipped sanity (baro=" + baroH.format("%.1f")
+                + "m length=" + lengthM.toFloat().format("%.1f") + "m)");
+            return false;
+        }
+
         // Two-part filter. The barometric check rejects jumps whose
         // peak altitude never reaches 1.5 m above the takeoff baseline.
         // The airtime check is a backup for the detector's

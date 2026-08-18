@@ -67,7 +67,7 @@ class JumpDetector {
     // Maximum allowed airborne duration before forcing a landing. Kite
     // jumps are typically under 10 s; 30 s is a generous safety net so
     // a stuck detector cannot permanently lose the jump.
-    static const MAX_FLIGHT_MS        = 30000;
+    static const MAX_FLIGHT_MS        = 20000;
 
     // Minimum airborne duration before any landing path can fire.
     // Sub-second events (e.g. a wind gust lifting the rider briefly,
@@ -214,12 +214,12 @@ class JumpDetector {
             // split the flight into ascent and descent phases.
             var p = _aggregator.getLatestPressure();
             if (p != null) {
-                if (_minPressure == 0) {
-                    _minPressure = p[:pa];
-                } else if (p[:pa] < _minPressure) {
-                    _minPressure = p[:pa];
-                    _peakTs = when;
-                }
+                // Median-filtered minimum pressure. A single bad
+                // low reading (e.g. water splash on the sensor)
+                // would otherwise create a huge false height by
+                // overwriting _minPressure with the outlier. The
+                // helper rejects single-sample outliers.
+                _updateMinPressure(when);
                 // Append to the pressure-history ring (capped at
                 // PRESSURE_HISTORY_SIZE). Deduplicate consecutive
                 // entries with the same Pa value so the 40 Hz accel
@@ -531,6 +531,49 @@ class JumpDetector {
     function _resetPressureHistory() as Void {
         _pressureHistoryHead = 0;
         _pressureHistorySize = 0;
+    }
+
+    // Update _minPressure using the median of the last 3 pressure samples.
+    // A single outlier (e.g. water splash on the sensor) is rejected by
+    // the median: with 3 samples, a single bad low reading cannot move
+    // the median below the true lowest of the other two.
+    function _updateMinPressure(when as Number) as Void {
+        var recent = _aggregator.getRecentPressure(3);
+        if (recent.size() == 0) { return; }
+        var median = _medianPressure(recent);
+        if (_minPressure == 0 || median < _minPressure) {
+            _minPressure = median;
+            _peakTs = when;
+        }
+    }
+
+    // Median of an array of pressure samples (sorted by :pa).
+    // Mutates `samples` via insertion sort, then returns the middle
+    // value (or the average of the two middle values when the count
+    // is even).
+    function _medianPressure(samples as Array<Dictionary>) as Number {
+        var n = samples.size();
+        if (n == 1) {
+            return samples[0][:pa];
+        }
+        // Simple insertion-sort by :pa, then pick middle.
+        for (var i = 1; i < n; i++) {
+            var key = samples[i];
+            var j = i - 1;
+            while (j >= 0 && samples[j][:pa] > key[:pa]) {
+                samples[j + 1] = samples[j];
+                j--;
+            }
+            samples[j + 1] = key;
+        }
+        if (n % 2 == 1) {
+            return samples[n / 2][:pa];
+        } else {
+            // Even count: average the two middle values.
+            var a = samples[n / 2 - 1][:pa];
+            var b = samples[n / 2][:pa];
+            return (a + b) / 2;
+        }
     }
 
     // Force a landing without corroboration. Used by the AIRBORNE

@@ -18,14 +18,18 @@ kite jumps from the on-wrist accelerometer, barometer, and GPS.
   barometric pressure returns to baseline **and** the descent rate
   flattens (preferred), GPS speed drops below 1.5 m/s for 500 ms
   (backup), or a low-G impact spike + freefall confirmation
-  (legacy, requires pressure or GPS corroboration). A 30 s
+  (legacy, requires pressure or GPS corroboration). A 20 s
   `MAX_FLIGHT_MS` watchdog force-lands the jump if nothing else
   closes it.
 - After each landing, `SessionManager.addJumpLap` checks the
   barometric height against a 1.5 m gate and the airtime against a
   1 s gate; jumps that pass are written as a FIT lap and trigger a
   short `SummaryView` popup showing a large centred height with the
-  proper `m` suffix.
+  proper `m` suffix. A sanity discard rejects any landed jump whose
+  barometric height exceeds 20 m or whose takeoff-to-landing distance
+  exceeds 100 m — neither value is a realistic kiteboarding jump on a
+  wrist-mounted sensor, and the discard prevents splash/weather-driven
+  pressure outliers from polluting the FIT file.
 - Press **START** to end the session. The `SessionReviewView` lists
   every recorded jump one per screen; UP/DOWN scrolls the list,
   BACK exits. The FIT activity syncs to Garmin Connect and each jump
@@ -67,6 +71,12 @@ A jump is recognised in three stages.
      Pa from the pre-jump baseline (~1.7 m of climb). Sustained
      low-G windows without altitude change are discarded by
      `_discardJump`.
+   - The lowest Pa observed during flight (`_minPressure`) is updated
+     from the **median of the last 3 pressure samples** (see
+     `_updateMinPressure` / `_medianPressure`). A single splash or
+     weather-driven outlier can no longer permanently set the peak
+     for the whole jump, so the barometric height in `_enterLanding`
+     reflects real climbs only.
 3. **Landing.** Three paths in priority order:
    - **Pressure (preferred).** `|P_current - P_baseline| <= PRESSURE_RETURN_PA` (20 Pa)
      AND `|descentRate| <= DESCENT_FLAT_PA_S` (5 Pa/s) — descent
@@ -78,19 +88,25 @@ A jump is recognised in three stages.
      samples below `LANDING_G = 1.15`, freefall confirmed mid-flight
      (`_freefallConfirmed`), AND corroboration from pressure or GPS.
 4. **Watchdog (`tick`).** If the detector is still `AIRBORNE` after
-   `MAX_FLIGHT_MS = 30000` ms, `_forceLanding("maxFlightMs")` fires.
-   The 20 Pa pressure-drop gate applies here too — a 30 s hang
+   `MAX_FLIGHT_MS = 20000` ms, `_forceLanding("maxFlightMs")` fires.
+   The 20 Pa pressure-drop gate applies here too — a 20 s hang
    without altitude change is discarded.
 
 ### Record gate (`SessionManager.addJumpLap`)
 
-Both must hold for a landed jump to be written as a FIT lap:
+All three must hold for a landed jump to be written as a FIT lap:
 
 - `baroH > 1.5` m.
 - `airtimeS > 1.0` s.
+- Sanity caps: `baroH <= 20.0` m **and** `lengthM <= 100.0` m. A jump
+  whose barometric height exceeds 20 m or whose takeoff-to-landing
+  distance exceeds 100 m is logged and skipped — neither value is a
+  realistic kiteboarding jump on a wrist-mounted sensor, and the
+  discard is the second line of defence against splash/weather-driven
+  pressure outliers that slip past the median filter on `_minPressure`.
 
-Jumps failing either are logged but never reach the FIT file and
-never trigger `SummaryView`.
+Jumps failing any of these are logged but never reach the FIT file
+and never trigger `SummaryView`.
 
 ### Height
 
@@ -118,11 +134,13 @@ compatibility but is hardcoded to `0.0f`.
 | `DESCENT_FLAT_PA_S` | 5 | Maximum descent rate (Pa/s) for the pressure landing path. |
 | `GPS_SPEED_LOW_MPS` | 1.5 | GPS landing speed threshold. |
 | `GPS_LOW_FOR_LAND_MS` | 500 | GPS-low dwell required before the GPS path fires. |
-| `MAX_FLIGHT_MS` | **30000** | AIRBORNE watchdog. |
+| `MAX_FLIGHT_MS` | **20000** | AIRBORNE watchdog (lowered from 30000 — kite jumps are typically under 10 s, 20 s is a tight safety net that also limits the airborne window during which a bad pressure sample can pollute `_minPressure`). |
 | `COAST_MS` | 1500 | Debounce between consecutive jumps. |
 
-The final 1.5 m / 1 s record gate in `SessionManager.addJumpLap` is
-the third line of defence (after the two detector-side gates).
+The final 1.5 m / 1 s / 20 m / 100 m record gate in
+`SessionManager.addJumpLap` is the third line of defence (after the
+two detector-side gates: `MIN_FLIGHT_MS` + `TAKEOFF_PRESSURE_DROP_PA`,
+and the median-filtered `_minPressure` peak detection).
 
 ## Building
 
