@@ -115,8 +115,6 @@ lowest Pa observed during flight vs the takeoff baseline (ICAO
 formula). The accelerometer-derived ascent/descent height that the
 project originally produced is no longer used — wrist motion during
 riding made the half-freefall estimate too noisy on real data.
-`_accelField` is still created in the FIT session for layout
-compatibility but is hardcoded to `0.0f`.
 
 ### Jump-detection constants
 
@@ -270,17 +268,33 @@ docs/
   ENVIRONMENT.md          # macOS dev setup: Java, SDK, signing key
   SIDELOAD.md             # side-load to a real Instinct Solar 2
   TESTING.md              # simulator + unit-test workflow
-.kimchi/
-  docs/
-    CHANGELOG.md          # version-by-version summary of shipped behaviour
-    baro-only-jump-algorithm-review.md
-    barometric-landing-fix-plan.md
-    crash-fix-plan.md
-    jump-detection-threshold-plan.md
-    session-review-view-plan.md
-    verification.md
-    ... (research notes, prior plans)
 ```
+
+## Screens
+
+| View | When it appears | What it shows |
+|------|-----------------|---------------|
+| **StartView** | App launch | "Press START to begin" |
+| **SessionView** | During recording | Recording status and jump count (`Jumps: N`) |
+| **SummaryView** | Immediately after a recorded jump | Large centred height (e.g. `4.2m`) plus time and travel on the line below |
+| **SessionReviewView** | After ending the session | Scrollable list of recorded jumps (UP/DOWN). Each screen shows height, length, and airtime |
+
+Example SummaryView layout on the 176×176 Instinct Solar 2 screen:
+
+```
++-----------------+
+|                 |
+|                 |
+|      4.2m       |
+|                 |
+|   2.5s   5.1m   |
+|                 |
++-----------------+
+```
+
+All text is centred and kept away from the top-right circular bezel.
+
+Screenshot assets: `assets/screenshots/`
 
 ## Notes
 

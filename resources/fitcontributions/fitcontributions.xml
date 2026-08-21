@@ -30,10 +30,4 @@
               precision="1"
               dataLabel="@Strings.JumpAirtimeLabel"
               unitLabel="@Strings.SecondsUnit" />
-    <fitField id="3"
-              displayInActivityLaps="true"
-              sortOrder="3"
-              precision="1"
-              dataLabel="@Strings.JumpAccelHeightLabel"
-              unitLabel="@Strings.MetersUnit" />
 </fitContributions>

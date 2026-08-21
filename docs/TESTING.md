@@ -278,11 +278,10 @@ diskutil eject /Volumes/GARMIN
 ### Syncing to Garmin Connect
 
 `ActivityRecording.Session` writes one FIT lap per recorded jump,
-with custom fields `jump_height`, `jump_length`, `jump_airtime`,
-`jump_accel_height` (last one reserved at `0.0f`). Sync the watch
-with the phone to push the FIT to Garmin Connect. Side-loaded
-`.prg` files do write valid lap data to the FIT (download with
-FITCSVTool to inspect), but Connect will not render the custom
-columns because the rendering metadata lives in the app-store JSON.
-See `docs/SIDELOAD.md` § Publishing to Connect IQ Store for the
-private-beta workflow that makes the columns visible.
+with custom fields `jump_height`, `jump_length`, and `jump_airtime`.
+Sync the watch with the phone to push the FIT to Garmin Connect.
+Side-loaded `.prg` files do write valid lap data to the FIT
+(download with FITCSVTool to inspect), but Connect will not render
+the custom columns because the rendering metadata lives in the
+app-store JSON. See `docs/SIDELOAD.md` § Publishing to Connect IQ
+Store for the private-beta workflow that makes the columns visible.

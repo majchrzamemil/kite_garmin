@@ -773,3 +773,150 @@ function testEmptyPressureHistoryDoesNotCrash(logger as Test.Logger) as Boolean 
     logger.debug("testEmptyPressureHistoryDoesNotCrash: landingPathCode=" + lpc);
     return true;
 }
+
+// Regression for the median-filtered _minPressure added to reject
+// single-sample water/splash outliers. A single extreme low pressure
+// tick must not create a 300+ m false height.
+(:test)
+function testMedianRejectsSplashOutlier(logger as Test.Logger) as Boolean {
+    var agg = new SensorAggregator();
+    var det = new JumpDetector(agg);
+
+    agg.pushAccel(0.0, 0.0, 9.80665, 0);
+    agg.pushAccel(0.0, 0.0, 9.80665, 100);
+    agg.pushAccel(0.0, 0.0, 9.80665, 200);
+    agg.pushPressure(101325, 0);
+    agg.pushPosition(45.0 as Double, -73.0 as Double, 0);
+    det.onAccelSample(0.0, 0.0, 9.80665, 0);
+    det.onAccelSample(0.0, 0.0, 9.80665, 100);
+    det.onAccelSample(0.0, 0.0, 9.80665, 200);
+
+    det.onAccelSample(22.0, 0.0, 0.0, 500);
+    det.onAccelSample(22.0, 0.0, 0.0, 600);
+    det.onAccelSample(22.0, 0.0, 0.0, 700);
+
+    // Real climb to 60 Pa below baseline; hold it for several samples
+    // so the median sees the low reading.
+    agg.pushPressure(101265, 800);
+    agg.pushPressure(101265, 900);
+    agg.pushPressure(101265, 1000);
+    for (var t = 800; t < 1600; t += 100) {
+        det.onAccelSample(0.0, 0.0, 5.0, t);
+    }
+
+    // Single extreme outlier (2000 Pa below baseline). With only one
+    // sample the median of the last 3 stays at 101265, so _minPressure
+    // must not move to this value.
+    agg.pushPressure(99325, 1700);
+    det.onAccelSample(0.0, 0.0, 5.0, 1700);
+
+    // Back to the real low pressure and then return near baseline.
+    agg.pushPressure(101265, 1800);
+    agg.pushPressure(101320, 1900);
+    for (var t2 = 1800; t2 <= 2000; t2 += 100) {
+        det.onAccelSample(0.0, 0.0, 5.0, t2);
+    }
+
+    var jump = det.getLastJump();
+    if (jump == null) {
+        logger.debug("testMedianRejectsSplashOutlier: no jump recorded");
+        return false;
+    }
+    var heightM = jump[:heightM] as Number;
+    if (heightM == null || heightM.toFloat() > 15.0) {
+        logger.debug("Expected heightM < 15 m, got " + heightM);
+        return false;
+    }
+    logger.debug("testMedianRejectsSplashOutlier: heightM=" + heightM);
+    return true;
+}
+
+// The airborne watchdog must force a landing at MAX_FLIGHT_MS (now 20 s).
+(:test)
+function testMaxFlightTime20s(logger as Test.Logger) as Boolean {
+    var agg = new SensorAggregator();
+    var det = new JumpDetector(agg);
+
+    agg.pushAccel(0.0, 0.0, 9.80665, 0);
+    agg.pushAccel(0.0, 0.0, 9.80665, 100);
+    agg.pushAccel(0.0, 0.0, 9.80665, 200);
+    agg.pushPressure(101325, 0);
+    agg.pushPosition(45.0 as Double, -73.0 as Double, 0);
+    det.onAccelSample(0.0, 0.0, 9.80665, 0);
+    det.onAccelSample(0.0, 0.0, 9.80665, 100);
+    det.onAccelSample(0.0, 0.0, 9.80665, 200);
+
+    det.onAccelSample(22.0, 0.0, 0.0, 500);
+    det.onAccelSample(22.0, 0.0, 0.0, 600);
+    det.onAccelSample(22.0, 0.0, 0.0, 700);
+
+    // Pressure drop satisfies the 20 Pa hybrid gate but never returns.
+    agg.pushPressure(101225, 800);
+
+    var t = 800;
+    while (t <= 20600) {
+        det.onAccelSample(0.0, 0.0, 10.787, t);
+        det.tick(t);
+        t += 100;
+    }
+
+    var jump = det.getLastJump();
+    if (jump == null) {
+        logger.debug("testMaxFlightTime20s: no jump recorded");
+        return false;
+    }
+    var duration = jump[:durationMs] as Number;
+    var lpc = jump[:landingPathCode] as Number;
+    if (duration == null || duration > 21000 || lpc == null || !lpc.equals(3)) {
+        logger.debug("Expected timeout ~20s, got duration=" + duration + " code=" + lpc);
+        return false;
+    }
+    logger.debug("testMaxFlightTime20s: duration=" + duration + " code=" + lpc);
+    return true;
+}
+
+// Normal jump with enough pressure samples that the median captures
+// the real peak and records a sane height.
+(:test)
+function testNormalJumpRecordedWithMedian(logger as Test.Logger) as Boolean {
+    var agg = new SensorAggregator();
+    var det = new JumpDetector(agg);
+
+    agg.pushAccel(0.0, 0.0, 9.80665, 0);
+    agg.pushAccel(0.0, 0.0, 9.80665, 100);
+    agg.pushAccel(0.0, 0.0, 9.80665, 200);
+    agg.pushPressure(101325, 0);
+    agg.pushPosition(45.0 as Double, -73.0 as Double, 0);
+    det.onAccelSample(0.0, 0.0, 9.80665, 0);
+    det.onAccelSample(0.0, 0.0, 9.80665, 100);
+    det.onAccelSample(0.0, 0.0, 9.80665, 200);
+
+    det.onAccelSample(22.0, 0.0, 0.0, 500);
+    det.onAccelSample(22.0, 0.0, 0.0, 600);
+    det.onAccelSample(22.0, 0.0, 0.0, 700);
+
+    // 50 Pa drop, held for 3+ samples so the median sees it.
+    agg.pushPressure(101275, 800);
+    agg.pushPressure(101275, 900);
+    agg.pushPressure(101275, 1000);
+    for (var t = 800; t < 1800; t += 100) {
+        det.onAccelSample(0.0, 0.0, 5.0, t);
+    }
+
+    // Return to baseline so the pressure path lands.
+    agg.pushPressure(101320, 1900);
+    det.onAccelSample(0.0, 0.0, 9.80665, 2000);
+
+    var jump = det.getLastJump();
+    if (jump == null) {
+        logger.debug("testNormalJumpRecordedWithMedian: no jump recorded");
+        return false;
+    }
+    var heightM = jump[:heightM] as Number;
+    if (heightM == null || heightM.toFloat() < 3.0 || heightM.toFloat() > 7.0) {
+        logger.debug("Expected heightM 3–7 m, got " + heightM);
+        return false;
+    }
+    logger.debug("testNormalJumpRecordedWithMedian: heightM=" + heightM);
+    return true;
+}

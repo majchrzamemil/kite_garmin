@@ -327,11 +327,6 @@ class App extends Application.AppBase {
         // begin/abort/abort/begin cycle never accumulates stale jumps.
         _sessionJumps = [] as Array<Dictionary>;
         _sessionStartMs = System.getTimer();
-        // Clear any persisted "last session" from a previous run so a
-        // future in-app "Last Session" view never shows stale data
-        // while a new session is in progress.
-        Application.Storage.deleteValue("kite_last_session");
-        Logger.info("App.beginSession: sessionStartMs=" + _sessionStartMs + " storage=kite_last_session cleared");
         // Switch to SessionView BEFORE starting sensors so the UI
         // thread has settled before accelerometer/GPS callbacks can
         // fire. This avoids the "IQ!" race observed in the field.
@@ -391,11 +386,7 @@ class App extends Application.AppBase {
     // block to the log so every jump detected during the session can
     // be copied out of GARMIN/Apps/LOGS/APP.TXT and parsed offline.
     //
-    // The log is the single source of truth for per-jump detail. The
-    // previous Application.Storage backup under "kite_last_session" was
-    // removed: side-loaded .prg builds cannot reliably write to
-    // Storage, and the failure surfaced as a noisy ERROR line that
-    // obscured real diagnostics.
+    // The log is the single source of truth for per-jump detail.
     // ------------------------------------------------------------------
 
     function _dumpSession() as Void {

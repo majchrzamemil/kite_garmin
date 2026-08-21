@@ -1,0 +1,12 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="176" height="176" viewBox="0 0 176 176">
+  <!-- Instinct Solar 2 screen -->
+  <rect width="176" height="176" fill="#000000"/>
+  
+  <!-- Top-right circular bezel cutout hint (not drawn, but text avoids this area) -->
+  
+  <!-- Big centered height -->
+  <text x="88" y="78" font-family="Arial, Helvetica, sans-serif" font-size="48" fill="#FFFFFF" text-anchor="middle" font-weight="bold">4.2m</text>
+  
+  <!-- Time + travel below -->
+  <text x="88" y="118" font-family="Arial, Helvetica, sans-serif" font-size="20" fill="#AAAAAA" text-anchor="middle">2.5s   5.1m</text>
+</svg>

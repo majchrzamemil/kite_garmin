@@ -35,14 +35,12 @@ class SessionManager {
     static const FIELD_HEIGHT       = 0;
     static const FIELD_LENGTH       = 1;
     static const FIELD_AIRTIME      = 2;
-    static const FIELD_ACCEL_HEIGHT = 3;
 
     var _state        as Number;
     var _session      as ActivityRecording.Session?;
     var _heightField  as FitContributor.Field?;
     var _lengthField  as FitContributor.Field?;
     var _airtimeField as FitContributor.Field?;
-    var _accelField   as FitContributor.Field?;
     var _jumpCount    as Number;
 
     function initialize() {
@@ -51,7 +49,6 @@ class SessionManager {
         _heightField  = null;
         _lengthField  = null;
         _airtimeField = null;
-        _accelField   = null;
         _jumpCount    = 0;
     }
 
@@ -141,15 +138,8 @@ class SessionManager {
             FitContributor.DATA_TYPE_FLOAT,
             { :mesgType => FitContributor.MESG_TYPE_LAP, :units => "s" }
         );
-        Logger.info("SessionManager.startSession: before createField(accel_height)");
-        var accelField = session.createField(
-            "jump_accel_height",
-            FIELD_ACCEL_HEIGHT,
-            FitContributor.DATA_TYPE_FLOAT,
-            { :mesgType => FitContributor.MESG_TYPE_LAP, :units => "m" }
-        );
-        Logger.info("SessionManager.startSession: after createField (all four)");
-        if (hField == null || lField == null || aField == null || accelField == null) {
+        Logger.info("SessionManager.startSession: after createField (all three)");
+        if (hField == null || lField == null || aField == null) {
             Logger.error("session: createField returned null for one or more lap fields");
             session.discard();
             _state = STATE_IDLE;
@@ -170,7 +160,6 @@ class SessionManager {
         _heightField  = hField;
         _lengthField  = lField;
         _airtimeField = aField;
-        _accelField   = accelField;
         _jumpCount    = 0;
         _state        = STATE_RECORDING;
 
@@ -209,7 +198,6 @@ class SessionManager {
         _heightField  = null;
         _lengthField  = null;
         _airtimeField = null;
-        _accelField   = null;
 
         if (!stopped || !saved) {
             _state = STATE_IDLE;
@@ -236,7 +224,7 @@ class SessionManager {
             Logger.warn("addJumpLap: rejected, current state=" + getStateName());
             return false;
         }
-        if (_heightField == null || _lengthField == null || _airtimeField == null || _accelField == null) {
+        if (_heightField == null || _lengthField == null || _airtimeField == null) {
             Logger.error("addJumpLap: one or more lap fields are null");
             return false;
         }
@@ -283,11 +271,10 @@ class SessionManager {
             + " airtimeS=" + airtimeS.format("%.2f")
         );
 
-        Logger.info("SessionManager.addJumpLap: before setData (all four fields)");
+        Logger.info("SessionManager.addJumpLap: before setData (all fields)");
         _heightField.setData(baroH);
         _lengthField.setData(lengthM.toFloat());
         _airtimeField.setData(airtimeS);
-        _accelField.setData(0.0f);
         Logger.info("SessionManager.addJumpLap: after setData");
 
         Logger.info("SessionManager.addJumpLap: before addLap()");

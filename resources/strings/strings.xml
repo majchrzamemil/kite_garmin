@@ -10,7 +10,6 @@
   <string id="JumpHeightLabel">Jump Height</string>
   <string id="JumpLengthLabel">Jump Length</string>
   <string id="JumpAirtimeLabel">Airtime</string>
-  <string id="JumpAccelHeightLabel">Jump Height (Accel)</string>
   <string id="MetersUnit">m</string>
   <string id="SecondsUnit">s</string>
 </strings>

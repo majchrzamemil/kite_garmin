@@ -145,9 +145,9 @@ class JumpDetector {
         _pressureHistorySize = 0;
         _gpsLowSinceTs    = 0;
         _lastLandingPath  = "";
-        // Defensive: explicitly reset the ring state in case the
-        // underlying storage had stale values left over from a previous
-        // detector instance (e.g. via Application.Storage).
+        // Defensive: reset the pressure-history ring to empty so any
+        // stale entries from a previous instance cannot feed into the
+        // descent-rate calculation.
         _pressureHistoryHead = 0;
         _pressureHistorySize = 0;
     }
