@@ -232,22 +232,26 @@ class App extends Application.AppBase {
             return;
         }
         Logger.info("App._checkForLandedJump: before addJumpLap");
+        // Track the jump for the session-end dump BEFORE writing the FIT
+        // lap. The detector creates a fresh Dictionary per landing, and
+        // addJumpLap runs synchronously here, but stopSession() can race
+        // ahead on the UI thread and save the FIT file before this
+        // callback finishes adding to _sessionJumps. Adding first ensures
+        // the in-app review/dump can never lag behind the FIT file.
+        _sessionJumps.add(jump);
+
         var recorded = _sessionManager.addJumpLap(jump);
         Logger.info("App._checkForLandedJump: after addJumpLap (recorded=" + recorded + ")");
+        jump[:recorded] = recorded;
+
         if (!recorded) {
             // SessionManager filtered this jump (e.g. baro heightM <= 1.5m
-            // threshold). Skip all per-jump UI bookkeeping and never push
-            // SummaryView, since this jump was rejected as invalid.
+            // threshold). It stays in _sessionJumps with :recorded=false
+            // for diagnostic dumps; SessionReviewView filters it out.
+            // Skip per-jump UI bookkeeping and never push SummaryView.
             Logger.info("ui: jump filtered (heightM=" + jump[:heightM] + "m), not showing popup");
             return;
         }
-
-        // Track every recorded jump for the session-end dump. The
-        // detector creates a fresh Dictionary per landing, so storing the
-        // reference here is safe even if a new jump later overwrites
-        // _detector._lastJump.
-        jump[:recorded] = recorded;
-        _sessionJumps.add(jump);
 
         // Accumulate airtime for the DoneView summary.
         var duration = jump.get(:durationMs);
