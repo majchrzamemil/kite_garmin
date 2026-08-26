@@ -60,6 +60,13 @@ class JumpDetector {
     // after pressure has returned to baseline. ~5 Pa/s ~= 0.4 m/s.
     static const DESCENT_FLAT_PA_S    = 5;
 
+    // Single-sample pressure drop larger than this is treated as a
+    // water splash / sensor glitch and ignored when tracking the
+    // jump peak. ~500 Pa ≈ 40 m at sea level — large enough to
+    // accept any realistic kite jump in one 1 Hz sample while still
+    // rejecting the 300 m+ / ~3600 Pa spikes seen in real-watch logs.
+    static const SPLASH_OUTLIER_PA    = 500;
+
     // Pressure-history ring buffer size (samples). At 1 Hz pressure
     // updates this gives a ~4 s window for descent-rate calculation.
     static const PRESSURE_HISTORY_SIZE = 4;
@@ -214,12 +221,19 @@ class JumpDetector {
             // split the flight into ascent and descent phases.
             var p = _aggregator.getLatestPressure();
             if (p != null) {
-                // Median-filtered minimum pressure. A single bad
-                // low reading (e.g. water splash on the sensor)
-                // would otherwise create a huge false height by
-                // overwriting _minPressure with the outlier. The
-                // helper rejects single-sample outliers.
-                _updateMinPressure(when);
+                // Track lowest pressure (= highest altitude). Reject
+                // single-sample splash outliers that are dramatically
+                // lower than the current minimum; everything else is
+                // allowed to update the peak.
+                if (_minPressure == 0) {
+                    _minPressure = p[:pa];
+                    _peakTs = when;
+                } else if (p[:pa] < _minPressure - SPLASH_OUTLIER_PA) {
+                    // Single-sample water/splash glitch — ignore.
+                } else if (p[:pa] < _minPressure) {
+                    _minPressure = p[:pa];
+                    _peakTs = when;
+                }
                 // Append to the pressure-history ring (capped at
                 // PRESSURE_HISTORY_SIZE). Deduplicate consecutive
                 // entries with the same Pa value so the 40 Hz accel
@@ -533,49 +547,6 @@ class JumpDetector {
         _pressureHistorySize = 0;
     }
 
-    // Update _minPressure using the median of the last 3 pressure samples.
-    // A single outlier (e.g. water splash on the sensor) is rejected by
-    // the median: with 3 samples, a single bad low reading cannot move
-    // the median below the true lowest of the other two.
-    function _updateMinPressure(when as Number) as Void {
-        var recent = _aggregator.getRecentPressure(3);
-        if (recent.size() == 0) { return; }
-        var median = _medianPressure(recent);
-        if (_minPressure == 0 || median < _minPressure) {
-            _minPressure = median;
-            _peakTs = when;
-        }
-    }
-
-    // Median of an array of pressure samples (sorted by :pa).
-    // Mutates `samples` via insertion sort, then returns the middle
-    // value (or the average of the two middle values when the count
-    // is even).
-    function _medianPressure(samples as Array<Dictionary>) as Number {
-        var n = samples.size();
-        if (n == 1) {
-            return samples[0][:pa];
-        }
-        // Simple insertion-sort by :pa, then pick middle.
-        for (var i = 1; i < n; i++) {
-            var key = samples[i];
-            var j = i - 1;
-            while (j >= 0 && samples[j][:pa] > key[:pa]) {
-                samples[j + 1] = samples[j];
-                j--;
-            }
-            samples[j + 1] = key;
-        }
-        if (n % 2 == 1) {
-            return samples[n / 2][:pa];
-        } else {
-            // Even count: average the two middle values.
-            var a = samples[n / 2 - 1][:pa];
-            var b = samples[n / 2][:pa];
-            return (a + b) / 2;
-        }
-    }
-
     // Force a landing without corroboration. Used by the AIRBORNE
     // timeout to recover a jump that the other paths failed to close.
     //
@@ -591,8 +562,8 @@ class JumpDetector {
         }
         var cur = _aggregator.getLatestPressure();
         var pressureDrop = 0;
-        if (cur != null && _baselinePressure > 0) {
-            pressureDrop = _baselinePressure - cur[:pa];
+        if (_baselinePressure > 0 && _minPressure > 0) {
+            pressureDrop = _baselinePressure - _minPressure;
         }
         if (pressureDrop < TAKEOFF_PRESSURE_DROP_PA) {
             Logger.warn("detector: timeout discard no pressure drop elapsedMs=" + (when - _jumpStartTs)

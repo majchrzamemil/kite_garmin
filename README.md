@@ -72,11 +72,10 @@ A jump is recognised in three stages.
      low-G windows without altitude change are discarded by
      `_discardJump`.
    - The lowest Pa observed during flight (`_minPressure`) is updated
-     from the **median of the last 3 pressure samples** (see
-     `_updateMinPressure` / `_medianPressure`). A single splash or
-     weather-driven outlier can no longer permanently set the peak
-     for the whole jump, so the barometric height in `_enterLanding`
-     reflects real climbs only.
+     from the latest pressure sample, but a single-sample drop larger
+     than `SPLASH_OUTLIER_PA = 100` Pa is rejected as a water splash
+     or sensor glitch. Real climbs are captured; isolated outliers
+     cannot permanently set the peak for the whole jump.
 3. **Landing.** Three paths in priority order:
    - **Pressure (preferred).** `|P_current - P_baseline| <= PRESSURE_RETURN_PA` (20 Pa)
      AND `|descentRate| <= DESCENT_FLAT_PA_S` (5 Pa/s) — descent
@@ -103,7 +102,7 @@ All three must hold for a landed jump to be written as a FIT lap:
   distance exceeds 100 m is logged and skipped — neither value is a
   realistic kiteboarding jump on a wrist-mounted sensor, and the
   discard is the second line of defence against splash/weather-driven
-  pressure outliers that slip past the median filter on `_minPressure`.
+  pressure outliers that slip past the outlier rejection on `_minPressure`.
 
 Jumps failing any of these are logged but never reach the FIT file
 and never trigger `SummaryView`.
@@ -133,12 +132,13 @@ riding made the half-freefall estimate too noisy on real data.
 | `GPS_SPEED_LOW_MPS` | 1.5 | GPS landing speed threshold. |
 | `GPS_LOW_FOR_LAND_MS` | 500 | GPS-low dwell required before the GPS path fires. |
 | `MAX_FLIGHT_MS` | **20000** | AIRBORNE watchdog (lowered from 30000 — kite jumps are typically under 10 s, 20 s is a tight safety net that also limits the airborne window during which a bad pressure sample can pollute `_minPressure`). |
+| `SPLASH_OUTLIER_PA` | **100** | Single-sample pressure drop larger than this is rejected as a splash/sensor glitch (~8.3 m at sea level). |
 | `COAST_MS` | 1500 | Debounce between consecutive jumps. |
 
 The final 1.5 m / 1 s / 20 m / 100 m record gate in
 `SessionManager.addJumpLap` is the third line of defence (after the
 two detector-side gates: `MIN_FLIGHT_MS` + `TAKEOFF_PRESSURE_DROP_PA`,
-and the median-filtered `_minPressure` peak detection).
+and the outlier-rejected `_minPressure` peak detection).
 
 ## Building
 

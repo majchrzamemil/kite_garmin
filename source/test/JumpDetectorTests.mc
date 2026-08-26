@@ -774,9 +774,9 @@ function testEmptyPressureHistoryDoesNotCrash(logger as Test.Logger) as Boolean 
     return true;
 }
 
-// Regression for the median-filtered _minPressure added to reject
-// single-sample water/splash outliers. A single extreme low pressure
-// tick must not create a 300+ m false height.
+// Regression for the outlier-rejected minimum _minPressure added to
+// reject single-sample water/splash outliers. A single extreme low
+// pressure tick must not create a 300+ m false height.
 (:test)
 function testMedianRejectsSplashOutlier(logger as Test.Logger) as Boolean {
     var agg = new SensorAggregator();
@@ -918,5 +918,279 @@ function testNormalJumpRecordedWithMedian(logger as Test.Logger) as Boolean {
         return false;
     }
     logger.debug("testNormalJumpRecordedWithMedian: heightM=" + heightM);
+    return true;
+}
+
+// Regression for a 2 m jump that only catches one peak pressure sample
+// before pressure returns to baseline. The old median-of-3 filter
+// collapsed [baseline, peak, baseline] back to baseline so the
+// pressure-drop gate discarded the jump; the new outlier-rejected
+// minimum preserves the 25 Pa peak and records it.
+(:test)
+function testSmallJumpReturningBaseline(logger as Test.Logger) as Boolean {
+    var agg = new SensorAggregator();
+    var det = new JumpDetector(agg);
+
+    // Baseline.
+    agg.pushAccel(0.0, 0.0, 9.80665, 0);
+    agg.pushAccel(0.0, 0.0, 9.80665, 100);
+    agg.pushAccel(0.0, 0.0, 9.80665, 200);
+    agg.pushPressure(101325, 0);
+    agg.pushPosition(45.0 as Double, -73.0 as Double, 0);
+    det.onAccelSample(0.0, 0.0, 9.80665, 0);
+    det.onAccelSample(0.0, 0.0, 9.80665, 100);
+    det.onAccelSample(0.0, 0.0, 9.80665, 200);
+
+    // Takeoff at t=600-800 -> AIRBORNE at t=800.
+    det.onAccelSample(22.0, 0.0, 0.0, 600);
+    det.onAccelSample(22.0, 0.0, 0.0, 700);
+    det.onAccelSample(22.0, 0.0, 0.0, 800);
+
+    if (det.getState() != JumpDetector.STATE_AIRBORNE) {
+        logger.debug("testSmallJumpReturningBaseline: did not enter AIRBORNE");
+        return false;
+    }
+
+    // First AIRBORNE accel sample: latest pressure is still baseline
+    // (101325), so _minPressure gets seeded to 101325 via the
+    // _minPressure == 0 branch in _enterAirborne reset.
+    det.onAccelSample(0.0, 0.0, 5.0, 900);
+
+    // Single peak pressure sample at t=1000 (25 Pa below baseline).
+    // Push BEFORE the accel sample so getLatestPressure returns the
+    // peak. The new outlier check (101300 < 101325-100 = 101225? No)
+    // accepts the drop and updates _minPressure to 101300.
+    agg.pushPressure(101300, 1000);
+    det.onAccelSample(0.0, 0.0, 5.0, 1000);
+
+    // Hold low-G samples. _minPressure stays at 101300.
+    for (var t = 1100; t < 1900; t += 100) {
+        det.onAccelSample(0.0, 0.0, 5.0, t);
+    }
+
+    // Pressure returns to baseline at t=2000. The new value (101325)
+    // is NOT below _minPressure - SPLASH_OUTLIER_PA (101200), and NOT
+    // below _minPressure (101300), so _minPressure stays at 101300.
+    // This is the critical step: the old median-of-3 filter would
+    // collapse [baseline, peak, baseline] back to baseline and lose
+    // the 25 Pa peak.
+    agg.pushPressure(101325, 2000);
+    det.onAccelSample(0.0, 0.0, 5.0, 2000);
+
+    var jump = det.getLastJump();
+    if (jump == null) {
+        logger.debug("testSmallJumpReturningBaseline: no jump recorded");
+        return false;
+    }
+    var heightM = jump[:heightM] as Number;
+    if (heightM == null || heightM.toFloat() <= 1.0) {
+        logger.debug("Expected heightM > 1.0, got " + heightM);
+        return false;
+    }
+    var peakDelta = jump[:peakDeltaPa] as Number;
+    if (peakDelta == null || peakDelta <= 15) {
+        logger.debug("Expected peakDeltaPa > 15, got " + peakDelta);
+        return false;
+    }
+    logger.debug("testSmallJumpReturningBaseline: heightM=" + heightM + " peakDeltaPa=" + peakDelta);
+    return true;
+}
+
+// Regression for the _forceLanding fix: the 20 s AIRBORNE timeout must
+// compute its pressure-drop gate from _minPressure (the captured peak),
+// not from the current pressure reading. In this test pressure returns
+// to baseline long before the timeout, but the descent rate stays high
+// so the normal pressure landing path never fires. The old buggy code
+// would see pressureDrop ≈ 0 from the current reading and discard the
+// jump; the fixed code uses _minPressure and records it via the timeout
+// path (landingPathCode=3).
+(:test)
+function testForceLandingUsesMinPressure(logger as Test.Logger) as Boolean {
+    var agg = new SensorAggregator();
+    var det = new JumpDetector(agg);
+
+    agg.pushAccel(0.0, 0.0, 9.80665, 0);
+    agg.pushAccel(0.0, 0.0, 9.80665, 100);
+    agg.pushAccel(0.0, 0.0, 9.80665, 200);
+    agg.pushPressure(101325, 0);
+    det.onAccelSample(0.0, 0.0, 9.80665, 0);
+    det.onAccelSample(0.0, 0.0, 9.80665, 100);
+    det.onAccelSample(0.0, 0.0, 9.80665, 200);
+
+    det.onAccelSample(22.0, 0.0, 0.0, 500);
+    det.onAccelSample(22.0, 0.0, 0.0, 600);
+    det.onAccelSample(22.0, 0.0, 0.0, 700);
+
+    // Capture a 100 Pa peak at t=800.
+    agg.pushPressure(101225, 800);
+    det.onAccelSample(0.0, 0.0, 5.0, 800);
+
+    // Keep g > LANDING_G (1.15) so _belowCount and _freefallCount never
+    // advance; no GPS positions are pushed. The only landing path that
+    // could fire is pressure, but we keep the descent rate magnitude
+    // above DESCENT_FLAT_PA_S by oscillating pressure every 1 Hz sample
+    // between baseline and peak. pressureReturned is sometimes true, but
+    // descentFlat is always false, so the pressure path cannot land.
+    // This forces the MAX_FLIGHT_MS timeout.
+    var t = 900;
+    var atBaseline = true;
+    while (t <= 21600) {
+        if (t % 1000 == 0) {
+            if (atBaseline) {
+                agg.pushPressure(101225, t);
+            } else {
+                agg.pushPressure(101325, t);
+            }
+            atBaseline = !atBaseline;
+        }
+        // 1.20 G -> above LANDING_G, below a re-takeoff concern.
+        det.onAccelSample(0.0, 0.0, 11.768, t);
+        det.tick(t);
+        t += 100;
+    }
+
+    var jump = det.getLastJump();
+    if (jump == null) {
+        logger.debug("testForceLandingUsesMinPressure: no jump recorded");
+        return false;
+    }
+    var lpc = jump.get(:landingPathCode);
+    if (lpc == null || !lpc.equals(3)) {
+        logger.debug("Expected landingPathCode=3 (timeout), got " + lpc);
+        return false;
+    }
+    var peakDelta = jump[:peakDeltaPa] as Number;
+    if (peakDelta == null || peakDelta < 80) {
+        logger.debug("Expected peakDeltaPa >= 80, got " + peakDelta);
+        return false;
+    }
+    logger.debug("testForceLandingUsesMinPressure: landingPathCode=" + lpc + " peakDeltaPa=" + peakDelta);
+    return true;
+}
+
+// Regression for a large jump with a legitimate ~180 Pa drop held for
+// several pressure samples. The new outlier-rejected minimum must
+// preserve the full drop (no median collapse) and the recorded height
+// must reflect the real climb. Land via the lowG path because the
+// pressure-history descent rate stays high during a rapid return to
+// baseline, which prevents descentFlat from prematurely satisfying
+// the pressure landing path.
+(:test)
+function testLargeJumpLegitimateDrop(logger as Test.Logger) as Boolean {
+    var agg = new SensorAggregator();
+    var det = new JumpDetector(agg);
+
+    // Baseline.
+    agg.pushAccel(0.0, 0.0, 9.80665, 0);
+    agg.pushAccel(0.0, 0.0, 9.80665, 100);
+    agg.pushAccel(0.0, 0.0, 9.80665, 200);
+    agg.pushPressure(101325, 0);
+    agg.pushPosition(45.0 as Double, -73.0 as Double, 0);
+    det.onAccelSample(0.0, 0.0, 9.80665, 0);
+    det.onAccelSample(0.0, 0.0, 9.80665, 100);
+    det.onAccelSample(0.0, 0.0, 9.80665, 200);
+
+    // Takeoff -> AIRBORNE at t=700.
+    det.onAccelSample(22.0, 0.0, 0.0, 500);
+    det.onAccelSample(22.0, 0.0, 0.0, 600);
+    det.onAccelSample(22.0, 0.0, 0.0, 700);
+
+    // Push 4 pressure samples around 101145 (~180 Pa below baseline).
+    // The first sample at t=800 lands via the _minPressure == 0 branch
+    // in the new outlier check. Subsequent samples refine the min but
+    // none are dramatically below the current _minPressure, so none
+    // are rejected as splash outliers.
+    agg.pushPressure(101145, 800);
+    det.onAccelSample(0.0, 0.0, 5.0, 800);
+
+    agg.pushPressure(101144, 900);
+    det.onAccelSample(0.0, 0.0, 5.0, 900);
+
+    agg.pushPressure(101146, 1000);
+    det.onAccelSample(0.0, 0.0, 5.0, 1000);
+
+    agg.pushPressure(101147, 1100);
+    det.onAccelSample(0.0, 0.0, 5.0, 1100);
+
+    // Continue low-G. _belowCount stays high; freefall was confirmed
+    // at t=800.
+    for (var t2 = 1200; t2 < 1800; t2 += 100) {
+        det.onAccelSample(0.0, 0.0, 5.0, t2);
+    }
+
+    // Return to baseline. lowG path requires
+    // pressureReturned OR gpsSlowForLongEnough; this satisfies
+    // pressureReturned.
+    agg.pushPressure(101325, 1800);
+    det.onAccelSample(0.0, 0.0, 5.0, 1800);
+
+    var jump = det.getLastJump();
+    if (jump == null) {
+        logger.debug("testLargeJumpLegitimateDrop: no jump recorded");
+        return false;
+    }
+    var heightM = jump[:heightM] as Number;
+    if (heightM == null || heightM.toFloat() <= 10.0) {
+        logger.debug("Expected heightM > 10, got " + heightM);
+        return false;
+    }
+    var peakDelta = jump[:peakDeltaPa] as Number;
+    if (peakDelta == null || peakDelta < 150) {
+        logger.debug("Expected peakDeltaPa >= 150, got " + peakDelta);
+        return false;
+    }
+    logger.debug("testLargeJumpLegitimateDrop: heightM=" + heightM + " peakDeltaPa=" + peakDelta);
+    return true;
+}
+
+// A legitimate large drop must be accepted even when _minPressure is
+// first seeded to the baseline (i.e., the first pressure sample in
+// STATE_AIRBORNE is the takeoff baseline). This guards against an
+// outlier threshold that is too low.
+(:test)
+function testLargeDropFromBaselineAccepted(logger as Test.Logger) as Boolean {
+    var agg = new SensorAggregator();
+    var det = new JumpDetector(agg);
+
+    agg.pushAccel(0.0, 0.0, 9.80665, 0);
+    agg.pushAccel(0.0, 0.0, 9.80665, 100);
+    agg.pushAccel(0.0, 0.0, 9.80665, 200);
+    agg.pushPressure(101325, 0);
+    agg.pushPosition(45.0 as Double, -73.0 as Double, 0);
+    det.onAccelSample(0.0, 0.0, 9.80665, 0);
+    det.onAccelSample(0.0, 0.0, 9.80665, 100);
+    det.onAccelSample(0.0, 0.0, 9.80665, 200);
+
+    det.onAccelSample(22.0, 0.0, 0.0, 500);
+    det.onAccelSample(22.0, 0.0, 0.0, 600);
+    det.onAccelSample(22.0, 0.0, 0.0, 700);
+
+    // Seed _minPressure to baseline on the first AIRBORNE accel sample
+    // before any fresh pressure sample arrives.
+    det.onAccelSample(0.0, 0.0, 5.0, 800);
+
+    // First real pressure reading is a large 180 Pa drop from baseline.
+    // With SPLASH_OUTLIER_PA=500 this must be accepted.
+    agg.pushPressure(101145, 900);
+    det.onAccelSample(0.0, 0.0, 5.0, 900);
+
+    for (var t = 1000; t < 1800; t += 100) {
+        det.onAccelSample(0.0, 0.0, 5.0, t);
+    }
+
+    agg.pushPressure(101325, 1900);
+    det.onAccelSample(0.0, 0.0, 5.0, 1900);
+
+    var jump = det.getLastJump();
+    if (jump == null) {
+        logger.debug("testLargeDropFromBaselineAccepted: no jump recorded");
+        return false;
+    }
+    var peakDelta = jump[:peakDeltaPa] as Number;
+    if (peakDelta == null || peakDelta < 150) {
+        logger.debug("Expected peakDeltaPa >= 150, got " + peakDelta);
+        return false;
+    }
+    logger.debug("testLargeDropFromBaselineAccepted: peakDeltaPa=" + peakDelta);
     return true;
 }
