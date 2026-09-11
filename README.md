@@ -8,22 +8,21 @@ kite jumps from the on-wrist accelerometer, barometer, and GPS.
 
 - Press **START** on the watchface, launch **Kite Tracker**, press
   **START** again to begin a session.
-- The app detects jumps automatically from the sensor stream using a
-  **hybrid filter**: an accelerometer takeoff spike (≥ 1.10 G total-G
-  for ~120 ms) starts an airborne window, and a barometric pressure
-  drop (≥ 20 Pa from the pre-jump baseline within the first second)
-  confirms it was a real altitude change. Sub-1-second events and
-  candidates with no altitude change are discarded.
-- Landing is detected by **three independent paths** in priority order:
-  barometric pressure returns to baseline **and** the descent rate
-  flattens (preferred), GPS speed drops below 1.5 m/s for 500 ms
-  (backup), or a low-G impact spike + freefall confirmation
-  (legacy, requires pressure or GPS corroboration). A 20 s
-  `MAX_FLIGHT_MS` watchdog force-lands the jump if nothing else
-  closes it.
-- After each landing, `SessionManager.addJumpLap` checks the
-  barometric height against a 1.5 m gate and the airtime against a
-  1 s gate; jumps that pass are written as a FIT lap and trigger a
+- The app detects jumps with a **landing-first** algorithm: the
+  trigger is the **landing impact** (total-G ≥ 1.8 G for ~80 ms — the
+  single biggest, rarest wrist signal in kiteboarding), and the
+  jump is validated by walking **backwards** through the
+  pre-impact window: the flight must be a *quiet* accelerometer
+  window (riding chop stops when you leave the water) of 0.8–8 s
+  containing at least one reduced-G sample (< 0.9 G), and the
+  median-of-3 smoothed barometer must show a **dip-and-return**
+  shape — ≥ 18 Pa below the pre-takeoff baseline during flight and
+  back within 30 Pa of it after landing. The return check is what
+  rejects tack ram-air drift; the median kills single-sample splash
+  spikes.
+- After each recorded jump, `SessionManager.addJumpLap` checks the
+  barometric height against a 1.2 m gate and the airtime against a
+  0.75 s gate; jumps that pass are written as a FIT lap and trigger a
   short `SummaryView` popup showing a large centred height with the
   proper `m` suffix. A sanity discard rejects any landed jump whose
   barometric height exceeds 20 m or whose takeoff-to-landing distance
@@ -54,55 +53,68 @@ because it changes with altitude (~12 Pa / metre).
 6.0.2 devices including the Instinct Solar 2, so the accelerometer
 runs on the legacy `Sensor.getInfo()` poll loop instead.
 
-### Algorithm — hybrid jump detection
+### Algorithm — landing-first jump detection
 
-A jump is recognised in three stages.
+A jump is recognised by its **landing**, then validated by looking
+backwards at the window before the impact. This inverts the original
+takeoff-first design, which produced a flood of fake jumps on real
+water: a 1.10 G takeoff threshold sits inside riding-chop noise, and
+a 20 Pa barometric "climb" gate is satisfied ~38% of all seconds by
+ram-air pressure changes through tacks and water film on the
+pressure port. The landing impact is the single biggest, rarest,
+cleanest wrist signal in kiteboarding, so it is the trigger.
 
-1. **Takeoff (`STATE_ARMED` → `STATE_AIRBORNE`).** Three consecutive
-   accelerometer samples whose total-G magnitude meets or exceeds
-   `TAKEOFF_G = 1.10` (~120 ms at 25 Hz effective rate). Lowered
-   from the original 1.25 after field tests showed soft kite
-   launches never spike above ~1.2 G.
-2. **Pre-landing gate (`_maybeLand`, must pass before any landing
-   path fires).**
-   - Airborne for at least `MIN_FLIGHT_MS = 1000` ms. Sub-second
-     events (wind gusts, bar yanks, wrist impacts) are discarded.
-   - Pressure has dropped by at least `TAKEOFF_PRESSURE_DROP_PA = 20`
-     Pa from the pre-jump baseline (~1.7 m of climb). Sustained
-     low-G windows without altitude change are discarded by
-     `_discardJump`.
-   - The lowest Pa observed during flight (`_minPressure`) is updated
-     from the latest pressure sample, but a single-sample drop larger
-     than `SPLASH_OUTLIER_PA = 100` Pa is rejected as a water splash
-     or sensor glitch. Real climbs are captured; isolated outliers
-     cannot permanently set the peak for the whole jump.
-3. **Landing.** Three paths in priority order:
-   - **Pressure (preferred).** `|P_current - P_baseline| <= PRESSURE_RETURN_PA` (20 Pa)
-     AND `|descentRate| <= DESCENT_FLAT_PA_S` (5 Pa/s) — descent
-     rate is computed by `_descentRatePaS` over a 4-sample pressure
-     ring buffer.
-   - **GPS speed (backup).** Ground speed below `GPS_SPEED_LOW_MPS = 1.5` m/s
-     for at least `GPS_LOW_FOR_LAND_MS = 500` ms.
-   - **Low-G impact (legacy + corroboration).** Three consecutive
-     samples below `LANDING_G = 1.15`, freefall confirmed mid-flight
-     (`_freefallConfirmed`), AND corroboration from pressure or GPS.
-4. **Watchdog (`tick`).** If the detector is still `AIRBORNE` after
-   `MAX_FLIGHT_MS = 20000` ms, `_forceLanding("maxFlightMs")` fires.
-   The 20 Pa pressure-drop gate applies here too — a 20 s hang
-   without altitude change is discarded.
+1. **Landing impact trigger (`STATE_ARMED`).** Total-G ≥
+   `LANDING_SPIKE_G = 1.8` for `LANDING_SPIKE_SAMPLES = 2` consecutive
+   samples (~80 ms). A single chop slap does not fire on its own.
+2. **Backward airborne-window scan (`_analyzeLanding`).** Walk back
+   through the pre-impact accelerometer history: an airborne wrist is
+   *quiet* (chop noise stops when you leave the water). A sample
+   above `AIRBORNE_G_HIGH = 1.5` is an excursion (chop hit, edge
+   load, kite yank, pop). The window ends at "riding": an excursion
+   run longer than `EXCURSION_RUN_MAX = 5` samples, or more than
+   `MAX_WINDOW_EXCURSIONS = 8` cumulative excursion samples (chop
+   occurs every 300–800 ms while riding). The takeoff is anchored at
+   the first excursion inside the window (the pop) when present,
+   else at the window start.
+3. **Flight gates.** Airtime within `MIN_FLIGHT_MS = 800` and
+   `MAX_FLIGHT_MS = 8000` ms, and at least one sample below
+   `FREEFALL_SOFT_G = 0.90` G inside the flight (weightlessness
+   evidence — the apex of even a small jump dips below 0.9 G for a
+   few samples at 25 Hz). Candidates that fail any gate are discarded
+   with a short (`DISCARD_COAST_MS = 300` ms) cooldown so a pop spike
+   does not blind the detector to the real landing that follows.
+4. **PENDING confirmation window.** A candidate is held for
+   `PENDING_MS = 1500` ms after the landing so post-landing
+   barometer samples arrive at the 1 Hz poll rate.
+5. **Barometric dip-and-return gate (`_maybeCompletePending`).** On
+   the median-of-3 smoothed pressure series: the baseline is the
+   median of samples in `[takeoff − 4 s, takeoff − 0.5 s]`; the
+   flight must dip ≥ `BARO_DIP_PA = 18` Pa below it; and the latest
+   post-landing sample must be back within `BARO_RETURN_PA = 30` Pa
+   of it. The return check is what rejects tack ram-air drift
+   (pressure steps down through a turn and *stays* down). The
+   median-of-3 smoothing kills single-sample splash spikes of any
+   size — the old `SPLASH_OUTLIER_PA` constant is gone.
+6. **No watchdog.** There is no persistent AIRBORNE state to get
+   stuck: a candidate that fails any gate is discarded, never
+   force-landed into the FIT file. The GPS-speed landing path is
+   gone too — real kite jumps land at riding speed (5–8 m/s), so
+   that path could only ever close fake events.
+
+States: `IDLE` → `ARMED` → (landing spike) → `PENDING` → (baro
+confirmation) → `COASTING` → `ARMED`.
 
 ### Record gate (`SessionManager.addJumpLap`)
 
-All three must hold for a landed jump to be written as a FIT lap:
+All must hold for a validated jump to be written as a FIT lap:
 
-- `baroH > 1.5` m.
-- `airtimeS > 1.0` s.
+- `baroH > 1.2` m.
+- `airtimeS > 0.75` s.
 - Sanity caps: `baroH <= 20.0` m **and** `lengthM <= 100.0` m. A jump
   whose barometric height exceeds 20 m or whose takeoff-to-landing
   distance exceeds 100 m is logged and skipped — neither value is a
-  realistic kiteboarding jump on a wrist-mounted sensor, and the
-  discard is the second line of defence against splash/weather-driven
-  pressure outliers that slip past the outlier rejection on `_minPressure`.
+  realistic kiteboarding jump on a wrist-mounted sensor.
 
 Jumps failing any of these are logged but never reach the FIT file
 and never trigger `SummaryView`.
@@ -110,35 +122,38 @@ and never trigger `SummaryView`.
 ### Height
 
 Barometer-only. `h = 44330 * (1 - (P_min / P_0)^0.190263)` on the
-lowest Pa observed during flight vs the takeoff baseline (ICAO
-formula). The accelerometer-derived ascent/descent height that the
-project originally produced is no longer used — wrist motion during
-riding made the half-freefall estimate too noisy on real data.
+lowest *median-of-3 smoothed* Pa observed during flight vs the
+pre-takeoff baseline median (ICAO formula). The accelerometer-derived
+ascent/descent height that the project originally produced is no
+longer used — wrist motion during riding made the half-freefall
+estimate too noisy on real data.
 
 ### Jump-detection constants
 
 | Constant | Value | Notes |
 |----------|-------|-------|
-| `TAKEOFF_G` | **1.10** | Soft over-correction; sub-1 m jumps are filtered by `SessionManager`. |
-| `LANDING_G` | 1.15 | Close to 1 G (freefall) but permissive. |
-| `TAKEOFF_SAMPLES` | 3 | Sustained spike, ~120 ms at 25 Hz. |
-| `LANDING_SAMPLES` | 3 | Sustained low-G, ~120 ms. |
-| `FREEFALL_G` | 1.05 | Mid-flight low-G confirmation. |
-| `FREEFALL_SAMPLES` | 1 | A single sample is enough. |
-| `MIN_FLIGHT_MS` | **1000** | No landing path may fire before 1 s. |
-| `TAKEOFF_PRESSURE_DROP_PA` | **20** | Required Pa drop after 1 s or the jump is discarded. |
-| `PRESSURE_RETURN_PA` | 20 | Pressure-return window for the pressure landing path. |
-| `DESCENT_FLAT_PA_S` | 5 | Maximum descent rate (Pa/s) for the pressure landing path. |
-| `GPS_SPEED_LOW_MPS` | 1.5 | GPS landing speed threshold. |
-| `GPS_LOW_FOR_LAND_MS` | 500 | GPS-low dwell required before the GPS path fires. |
-| `MAX_FLIGHT_MS` | **20000** | AIRBORNE watchdog (lowered from 30000 — kite jumps are typically under 10 s, 20 s is a tight safety net that also limits the airborne window during which a bad pressure sample can pollute `_minPressure`). |
-| `SPLASH_OUTLIER_PA` | **100** | Single-sample pressure drop larger than this is rejected as a splash/sensor glitch (~8.3 m at sea level). |
-| `COAST_MS` | 1500 | Debounce between consecutive jumps. |
+| `LANDING_SPIKE_G` | **1.8** | Landing impact trigger. |
+| `LANDING_SPIKE_SAMPLES` | 2 | Sustained ~80 ms at 25 Hz; single chop slaps don't fire. |
+| `AIRBORNE_G_HIGH` | 1.5 | Above this a sample is an excursion (chop / edge / yank / pop). |
+| `EXCURSION_RUN_MAX` | 5 | An excursion run longer than this = riding; window stops. |
+| `MAX_WINDOW_EXCURSIONS` | 8 | Cumulative excursions in the window; chop hits this within ~2 s. |
+| `MIN_FLIGHT_MS` | **800** | Shorter quiet window = chop slap, not a jump. |
+| `MAX_FLIGHT_MS` | **8000** | Backward scan cap (also the airtime ceiling). |
+| `FREEFALL_SOFT_G` | **0.90** | ≥ 1 sample below this in flight = weightlessness evidence. |
+| `BARO_DIP_PA` | **18** | Required smoothed dip below baseline during flight (~1.5 m). |
+| `BARO_RETURN_PA` | **30** | Post-landing sample must return this close to baseline. |
+| `BASELINE_BACK_MS` | 4000 | Baseline median window starts this far before takeoff. |
+| `BASELINE_GAP_MS` | 500 | Baseline median window ends this far before takeoff. |
+| `PENDING_MS` | 1500 | Post-landing wait for 1–2 fresh baro samples. |
+| `PRESSURE_LOOKBACK` | 20 | Pressure samples pulled from the ring at confirmation. |
+| `COAST_MS` | 1500 | Debounce after a recorded jump. |
+| `DISCARD_COAST_MS` | 300 | Short cooldown after a discarded event (e.g. a pop spike). |
+| `G_RING_CAPACITY` | 360 | Internal G-magnitude ring, ~9 s at the 40 Hz poll rate. |
 
-The final 1.5 m / 1 s / 20 m / 100 m record gate in
-`SessionManager.addJumpLap` is the third line of defence (after the
-two detector-side gates: `MIN_FLIGHT_MS` + `TAKEOFF_PRESSURE_DROP_PA`,
-and the outlier-rejected `_minPressure` peak detection).
+The final 1.2 m / 0.75 s / 20 m / 100 m record gate in
+`SessionManager.addJumpLap` is the last line of defence behind the
+detector-side gates (landing impact, quiet window, reduced-G
+sample, and the barometric dip-and-return shape).
 
 ## Building
 
@@ -198,7 +213,7 @@ The project pre-creates both `APP.TXT` and a lowercase `app.TXT`
 fallback when side-loading; whichever the watch writes to is the
 file to pull. Lines prefixed with `[KITE]` come from `Logger.mc`.
 Verbose logs from `SessionReviewView` are intentionally stripped so
-the detection lines (`JUMP AIRBORNE`, `detector: landing path=...`,
+the detection lines (`JUMP CANDIDATE`, `detector: discard ...`,
 `JUMP LANDED`, `SESSION_DUMP_*`) stay readable when scrolling
 through a 20-jump session.
 

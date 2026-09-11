@@ -76,14 +76,11 @@ class SessionReviewView extends WatchUi.View {
 
     // Translate a JumpDetector landing-path code back to a
     // human-readable string for on-screen display. Must stay in
-    // lock-step with JumpDetector._landingPathToCode():
-    // 0="pressure", 1="gps", 2="lowG", 3="timeout", -1 (and anything
-    // else)="unknown".
+    // lock-step with JumpDetector: 0="impact" (the landing-first
+    // redesign has a single detection path), anything else =
+    // "unknown".
     function _codeToLandingPath(code as Number) as String {
-        if (code == 0) { return "pressure"; }
-        if (code == 1) { return "gps"; }
-        if (code == 2) { return "lowG"; }
-        if (code == 3) { return "timeout"; }
+        if (code == 0) { return "impact"; }
         return "unknown";
     }
 

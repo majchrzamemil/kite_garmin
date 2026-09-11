@@ -252,15 +252,13 @@ class SessionManager {
         }
 
         // Two-part filter. The barometric check rejects jumps whose
-        // peak altitude never reaches 1.5 m above the takeoff baseline.
-        // The airtime check is a backup for the detector's
-        // MIN_FLIGHT_MS gate: if for any reason a sub-1-second jump
-        // reaches addJumpLap (e.g. a future code path bypasses the
-        // detector's _maybeLand guard) we still refuse to record it as
-        // a FIT lap. The matching detector-side check is the
-        // MIN_FLIGHT_MS early return in JumpDetector._maybeLand().
+        // peak altitude never reaches 1.2 m above the takeoff baseline
+        // (the detector's BARO_DIP_PA = 18 Pa gate corresponds to
+        // ~1.5 m, so this is mostly a redundant safety net — kept as
+        // defence in depth). The airtime check matches the detector's
+        // MIN_FLIGHT_MS = 800 ms gate.
         var airtimeS = duration.toFloat() / 1000.0;
-        if (baroH <= 1.5 || airtimeS <= 1.0) {
+        if (baroH <= 1.2 || airtimeS <= 0.75) {
             Logger.info("session: jump skipped (baro=" + baroH.format("%.1f") + "m airtime=" + airtimeS.format("%.2f") + "s)");
             return false;
         }
