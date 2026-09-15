@@ -20,6 +20,7 @@ import Toybox.Activity;
 import Toybox.Application;
 import Toybox.Graphics;
 import Toybox.Lang;
+import Toybox.Math;
 import Toybox.Position;
 import Toybox.Sensor;
 import Toybox.System;
@@ -28,6 +29,11 @@ import Toybox.Timer;
 import Toybox.WatchUi;
 
 class App extends Application.AppBase {
+
+    // Requested accelerometer sample rate, clamped to the device maximum
+    // at registration time. 25 Hz is what every JumpDetector threshold
+    // is written against.
+    static const ACCEL_RATE_HZ = 25;
 
     var _aggregator as SensorAggregator;
     var _detector as JumpDetector;
@@ -41,6 +47,26 @@ class App extends Application.AppBase {
     var _pendingJump as Dictionary?;
     var _sessionJumps as Array<Dictionary>;
     var _sessionStartMs as Number;
+
+    // Accelerometer feed. _accelPath records which of the two paths is
+    // live so the session dump can say so; see startSensorPipeline.
+    var _accelRateHz as Number;
+    var _accelPath as String;
+
+    // Per-session sensor statistics, emitted as one line each at session
+    // end. The 2026-09-14 session recorded 0 jumps and the log could not
+    // say why: the only clue was minG=1.09 on three discards. These two
+    // lines survive APP.TXT rotation and answer "is the feed real?".
+    var _gCount as Number;
+    var _gMin as Float;
+    var _gMax as Float;
+    var _gBelow100 as Number;
+    var _gBelow090 as Number;
+    var _paCount as Number;
+    var _paMin as Number;
+    var _paMax as Number;
+    var _paMaxStep as Number;
+    var _paLast as Number;
 
     function initialize() {
         AppBase.initialize();
@@ -56,6 +82,22 @@ class App extends Application.AppBase {
         _pendingJump = null;
         _sessionJumps = [] as Array<Dictionary>;
         _sessionStartMs = 0;
+        _accelRateHz = ACCEL_RATE_HZ;
+        _accelPath = "none";
+        // Assigned here as well as in _resetSensorStats because the type
+        // checker only tracks initialization done directly in the
+        // constructor. _resetSensorStats owns the real values.
+        _gCount = 0;
+        _gMin = 0.0f;
+        _gMax = 0.0f;
+        _gBelow100 = 0;
+        _gBelow090 = 0;
+        _paCount = 0;
+        _paMin = 0;
+        _paMax = 0;
+        _paMaxStep = 0;
+        _paLast = 0;
+        _resetSensorStats();
         Logger.info("App.initialize: done");
     }
 
@@ -96,19 +138,21 @@ class App extends Application.AppBase {
     function startSensorPipeline() as Void {
         Logger.info("pipeline: starting");
 
-        // Accelerometer via the legacy Sensor.getInfo() / info.accel
-        // path (API 1.0.0 / 2.0.0). Sensor.registerSensorDataListener
-        // (API 2.3.0) crashes on Connect IQ 6.0.2 devices (e.g.
-        // Instinct Solar 2) with "Symbol Not Found Error" on both
-        // dictionary-style and member-style access of the returned
-        // Sensor.SensorData. The accelerometer is granted by the
-        // <uses-permission id="Sensor"/> entry in manifest.xml, so no
-        // explicit enable call is needed; we just poll at 40 Hz via a
-        // Timer.
+        // Accelerometer via the streaming API. Sensor.getInfo().accel is
+        // a snapshot refreshed on the sensor's own cadence (~1 Hz on this
+        // hardware), so polling it at 40 Hz just re-reads one value: the
+        // 2026-09-14 session saw three >=1.8 G triggers in 44 minutes and
+        // a window minimum that never fell below 1.09 G. The streaming
+        // listener delivers real per-sample batches.
+        //
+        // registerSensorDataListener was previously believed to crash on
+        // Connect IQ 6.0.2, but both recorded crashes were our own misuse
+        // (dictionary access instead of .accelerometerData, and treating
+        // the batched x/y/z arrays as scalars). Both are handled in
+        // onSensorData; the poll path stays as a fallback in case there
+        // is a third cause.
         if (Toybox has :Sensor) {
-            _accelTimer = new Timer.Timer();
-            _accelTimer.start(method(:pollAccel), 25, true); // 40 Hz
-            Logger.info("pipeline: accelerometer polling timer started");
+            _startAccelStream();
         } else {
             Logger.warn("pipeline: Sensor module not available");
         }
@@ -141,6 +185,14 @@ class App extends Application.AppBase {
             _accelTimer = null;
         }
 
+        if (Toybox has :Sensor) {
+            try {
+                Sensor.unregisterSensorDataListener();
+            } catch (e) {
+                Logger.warn("pipeline: unregisterSensorDataListener e=" + e);
+            }
+        }
+
         if (_pressureTimer != null) {
             _pressureTimer.stop();
             _pressureTimer = null;
@@ -154,6 +206,83 @@ class App extends Application.AppBase {
     // ------------------------------------------------------------------
     // Callbacks
     // ------------------------------------------------------------------
+
+    // Register the streaming accelerometer listener. Falls back to the
+    // legacy 40 Hz getInfo() poll if registration throws, so a failure
+    // here degrades the session instead of ending it.
+
+    function _startAccelStream() as Void {
+        var rate = ACCEL_RATE_HZ;
+        if (Sensor has :getMaxSampleRate) {
+            var maxRate = Sensor.getMaxSampleRate();
+            if (maxRate != null && maxRate > 0 && maxRate < rate) {
+                rate = maxRate;
+            }
+        }
+        _accelRateHz = rate;
+
+        try {
+            Sensor.registerSensorDataListener(
+                method(:onSensorData),
+                {
+                    :period => 1,
+                    :accelerometer => { :enabled => true, :sampleRate => rate }
+                }
+            );
+            _accelPath = "stream";
+            Logger.info("pipeline: accel=stream rateHz=" + rate);
+        } catch (e) {
+            Logger.error("pipeline: accel stream failed, falling back e=" + e);
+            _accelTimer = new Timer.Timer();
+            _accelTimer.start(method(:pollAccel), 25, true); // 40 Hz
+            _accelPath = "poll";
+            Logger.info("pipeline: accel=poll");
+        }
+    }
+
+    // Streaming accelerometer callback. One batch per :period second.
+    //
+    // Two rules here are load-bearing, both learned from crashes:
+    // accelerometerData is a member, not a dictionary key; and x/y/z are
+    // Array<Number> of milli-G, not scalars. Nothing logs inside the
+    // loop - the recorded OOM came from string building on this path.
+
+    function onSensorData(data as Sensor.SensorData) as Void {
+        if (data == null) { return; }
+
+        var accel = null;
+        try {
+            accel = data.accelerometerData;
+        } catch (e) {
+            Logger.error("onSensorData: accelerometerData unavailable e=" + e);
+            return;
+        }
+        if (accel == null) { return; }
+
+        var xs = accel.x;
+        var ys = accel.y;
+        var zs = accel.z;
+        if (xs == null || ys == null || zs == null) { return; }
+
+        var n = xs.size();
+        if (n == 0 || ys.size() < n || zs.size() < n) { return; }
+
+        var now = System.getTimer();
+        for (var i = 0; i < n; i++) {
+            var when = batchSampleTime(now, n, i, _accelRateHz);
+            var x = xs[i].toFloat() * 9.80665 / 1000.0;
+            var y = ys[i].toFloat() * 9.80665 / 1000.0;
+            var z = zs[i].toFloat() * 9.80665 / 1000.0;
+            _aggregator.pushAccel(x, y, z, when);
+            _detector.onAccelSample(x, y, z, when);
+            _accumAccelStats(x, y, z);
+        }
+
+        // Once per batch, not once per sample: COAST_MS (1500 ms) is
+        // longer than the 1 s batch, so at most one jump can complete
+        // per callback.
+        _checkForLandedJump();
+    }
 
     function pollAccel() as Void {
         if (!(Toybox has :Sensor)) { return; }
@@ -174,6 +303,7 @@ class App extends Application.AppBase {
                 var when = System.getTimer();
                 _aggregator.pushAccel(x, y, z, when);
                 _detector.onAccelSample(x, y, z, when);
+                _accumAccelStats(x, y, z);
                 _checkForLandedJump();
             }
         }
@@ -181,38 +311,82 @@ class App extends Application.AppBase {
 
     function pollPressure() as Void {
         var rawPa = null;
-        var filteredPa = null;
         if (Toybox has :Activity) {
             var info = Activity.getActivityInfo();
             if (info != null) {
                 if (info has :rawAmbientPressure && info.rawAmbientPressure != null) {
                     rawPa = info.rawAmbientPressure;
                 }
-                if (info has :ambientPressure && info.ambientPressure != null) {
-                    filteredPa = info.ambientPressure;
-                }
             }
         }
 
-        Logger.info("pressure: raw=" + (rawPa == null ? "null" : rawPa.toFloat().format("%.1f"))
-            + " filtered=" + (filteredPa == null ? "null" : filteredPa.toFloat().format("%.1f")));
+        // NOTE: the raw/filtered pressure values are deliberately NOT
+        // logged per sample. The on-device APP.TXT log rotates at only
+        // a few KB, and 1 Hz sensor lines rotated away every interesting
+        // detector line during the 2026-09-11 test session. Per-event
+        // values (baseline/dip/drift) are carried by the detector's
+        // JUMP CANDIDATE / discard / LANDED lines instead.
 
         if (rawPa != null) {
-            _aggregator.pushPressure(rawPa.toNumber(), System.getTimer());
+            var pa = rawPa.toNumber();
+            _aggregator.pushPressure(pa, System.getTimer());
+            _accumBaroStats(pa);
         }
         _detector.tick(System.getTimer());
     }
 
     function onPosition(info as Position.Info) as Void {
-        Logger.info("App.onPosition: entered");
         if (info == null) {
             return;
         }
         var lat = info.position != null ? info.position.toDegrees()[0] : 0.0;
         var lon = info.position != null ? info.position.toDegrees()[1] : 0.0;
-        var when = info.when != null ? info.when.value() : System.getTimer();
-        _aggregator.pushPosition(lat, lon, when);
-        Logger.info("position: lat=" + lat.format("%.6f") + " lon=" + lon.format("%.6f"));
+        // Stamp the fix with System.getTimer() (the same clock the
+        // detector and accelerometer samples use), NOT the GPS
+        // Time.Moment. Mixing the two clocks made every position
+        // timestamp incomparable with jump timestamps, so jump length
+        // always computed to 0 (2026-09-11 session: lengthM=0.00 on
+        // every jump).
+        _aggregator.pushPosition(lat, lon, System.getTimer());
+    }
+
+    // --- Per-session sensor statistics -------------------------------
+
+    function _resetSensorStats() as Void {
+        _gCount     = 0;
+        _gMin       = 99.0f;
+        _gMax       = 0.0f;
+        _gBelow100  = 0;
+        _gBelow090  = 0;
+        _paCount    = 0;
+        _paMin      = 0;
+        _paMax      = 0;
+        _paMaxStep  = 0;
+        _paLast     = 0;
+    }
+
+    function _accumAccelStats(x as Float, y as Float, z as Float) as Void {
+        var g = Math.sqrt(x * x + y * y + z * z) / 9.80665;
+        _gCount++;
+        if (g < _gMin) { _gMin = g; }
+        if (g > _gMax) { _gMax = g; }
+        if (g < 1.00) { _gBelow100++; }
+        if (g < 0.90) { _gBelow090++; }
+    }
+
+    function _accumBaroStats(pa as Number) as Void {
+        if (_paCount == 0) {
+            _paMin = pa;
+            _paMax = pa;
+        } else {
+            if (pa < _paMin) { _paMin = pa; }
+            if (pa > _paMax) { _paMax = pa; }
+            var step = pa - _paLast;
+            if (step < 0) { step = -step; }
+            if (step > _paMaxStep) { _paMaxStep = step; }
+        }
+        _paLast = pa;
+        _paCount++;
     }
 
     function _checkForLandedJump() as Void {
@@ -220,13 +394,15 @@ class App extends Application.AppBase {
         if (jump == null) {
             return;
         }
-        Logger.info("App._checkForLandedJump: entered");
-        Logger.info("App._checkForLandedJump: jump found");
         var endTs = jump[:endTs];
         if (endTs == null || endTs <= _lastJumpEndTs) {
+            // Already-seen (or already-consumed) jump. This runs at the
+            // 40 Hz accel rate - logging here would flood the tiny
+            // on-device log and rotate the useful lines away.
             return;
         }
         _lastJumpEndTs = endTs;
+        Logger.info("App._checkForLandedJump: new jump endTs=" + endTs);
         if (!_sessionManager.isRecording()) {
             Logger.info("ui: jump detected while idle endTs=" + endTs + " - not displayed");
             return;
@@ -331,6 +507,7 @@ class App extends Application.AppBase {
         // begin/abort/abort/begin cycle never accumulates stale jumps.
         _sessionJumps = [] as Array<Dictionary>;
         _sessionStartMs = System.getTimer();
+        _resetSensorStats();
         // Switch to SessionView BEFORE starting sensors so the UI
         // thread has settled before accelerometer/GPS callbacks can
         // fire. This avoids the "IQ!" race observed in the field.
@@ -507,6 +684,32 @@ class App extends Application.AppBase {
         }
 
         var totalAirtimeS = totalAirtimeMs.toFloat() / 1000.0;
+
+        // Sensor-health lines. One each per session so they survive the
+        // APP.TXT rotation that erases per-event logging. ACCEL_STATS
+        // answers "is the accelerometer feed real?" (n should be
+        // rateHz x session seconds, and below090 must be non-zero on any
+        // session with real movement). BARO_STATS answers "is the
+        // pressure port usable?" - the 2026-09-14 FIT showed altitude
+        // steps above 50 m between consecutive records.
+        Logger.info(
+            "ACCEL_STATS"
+            + " path=" + _accelPath
+            + " n=" + _gCount
+            + " rateHz=" + _accelRateHz
+            + " minG=" + (_gCount > 0 ? _gMin.format("%.2f") : "n/a")
+            + " maxG=" + _gMax.format("%.2f")
+            + " below100=" + _gBelow100
+            + " below090=" + _gBelow090
+        );
+        Logger.info(
+            "BARO_STATS"
+            + " n=" + _paCount
+            + " minPa=" + _paMin
+            + " maxPa=" + _paMax
+            + " maxStepPa=" + _paMaxStep
+        );
+
         Logger.info(
             "SESSION_DUMP_END"
             + " totalJumps=" + _sessionJumps.size()
@@ -515,6 +718,17 @@ class App extends Application.AppBase {
             + " sessionDurationMs=" + sessionDurationMs
         );
     }
+}
+
+// Timestamp for sample i of an n-sample accelerometer batch that
+// finished at nowMs. Stamping every sample in a batch with one instant
+// would collapse the windows the detector walks backwards through, so
+// the batch is spread backwards at the sample interval.
+
+function batchSampleTime(nowMs as Number, n as Number, i as Number,
+                         rateHz as Number) as Number {
+    if (rateHz <= 0) { return nowMs; }
+    return nowMs - ((n - 1 - i) * 1000) / rateHz;
 }
 
 // Translate a JumpDetector landing-path code back to a human-readable

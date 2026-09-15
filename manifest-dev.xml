@@ -1,0 +1,55 @@
+<!--
+  DEV manifest. Identical to manifest.xml except for the application id
+  and the app name.
+
+  The store beta is installed from Connect IQ under the id in
+  manifest.xml. Side-loading a build that reuses that id would replace
+  the beta on the watch, so dev builds carry their own id and show up as
+  a separate "Kite Tracker Dev" entry. Keep every other field in lock-step
+  with manifest.xml.
+
+  Manifest for the Kite Jump Tracker Garmin app.
+
+  Target devices: Instinct 2 family (standard, Solar, 2S, 2X, Crossover).
+  App type: standalone Watch App with ActivityRecording permission so we can
+  emit a FIT activity file at session end. The FIT file syncs to Garmin
+  Connect, where each detected jump appears as one Lap with the jump's
+  distance, elapsed_time, and a custom jump_height field.
+-->
+<iq:manifest version="3" xmlns:iq="http://www.garmin.com/xml/connectiq">
+
+  <iq:application id="28ad45d21e5a4a32a977b8efe374601e"
+                  type="watch-app"
+                  name="@Strings.AppNameDev"
+                  entry="App"
+                  launcherIcon="@Drawables.LauncherIcon"
+                  minApiLevel="3.0.0">
+
+    <!-- Instinct 2 family (all hardware variants) -->
+    <iq:products>
+      <iq:product id="instinct2"/>
+      <iq:product id="instinct2s"/>
+      <iq:product id="instinct2x"/>
+      <iq:product id="instinctcrossover"/>
+    </iq:products>
+
+    <!-- Required permissions:
+         - Sensor          : accelerometer
+         - SensorHistory   : barometric pressure history
+         - Positioning     : GPS for horizontal jump length
+         - Fit             : emit a FIT activity file at session end
+         - FitContributor  : helper API for writing FIT via the system
+    -->
+    <iq:permissions>
+      <iq:uses-permission id="Sensor"/>
+      <iq:uses-permission id="SensorHistory"/>
+      <iq:uses-permission id="Positioning"/>
+      <iq:uses-permission id="Fit"/>
+      <iq:uses-permission id="FitContributor"/>
+    </iq:permissions>
+
+    <iq:languages>
+      <iq:language>eng</iq:language>
+    </iq:languages>
+  </iq:application>
+</iq:manifest>

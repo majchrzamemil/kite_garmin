@@ -1,0 +1,10 @@
+# Dev build variant.
+#
+# Same sources and resources as monkey.jungle, but points at
+# manifest-dev.xml so the side-loaded build gets its own application id
+# and does not overwrite the Connect IQ store beta on the watch.
+#
+#   ./build.sh --dev        -> build/app-dev.prg
+
+project.manifest = manifest-dev.xml
+base.sourcePath = source

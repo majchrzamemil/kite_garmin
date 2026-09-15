@@ -92,6 +92,12 @@ class JumpDetector {
     // a small jump dips below 0.9 G for a few samples at 25 Hz).
     static const FREEFALL_SOFT_G       = 0.90;
 
+    // GPS speed gate: real jumps only happen from riding speed. A
+    // stationary rider (wading out, body-dragging, water-start
+    // attempts) produces kite-yank spikes and port-dunk dips that
+    // otherwise pass every accelerometer/baro gate.
+    static const TAKEOFF_SPEED_MPS      = 3.0;
+
     // --- Barometric confirmation -------------------------------------
     // Applied at PENDING completion to the median-of-3 smoothed 1 Hz
     // pressure series. dip >= BARO_DIP_PA during flight AND the last
@@ -103,6 +109,13 @@ class JumpDetector {
     static const BASELINE_GAP_MS       = 500;
     static const PENDING_MS            = 1500;
     static const PRESSURE_LOOKBACK     = 20;
+
+    // Takeoff refinement: the first smoothed flight sample at least
+    // this far below the baseline marks where the pressure excursion
+    // began. The accelerometer-only window can extend back through
+    // calm flat-water riding before the pop, inflating airtime by
+    // seconds; anchoring to the dip start keeps airtime honest.
+    static const DIP_START_PA          = 8;
 
     // --- Debounce -----------------------------------------------------
     static const COAST_MS              = 1500;
@@ -438,6 +451,36 @@ class JumpDetector {
             return;
         }
 
+        // Takeoff refinement: anchor the takeoff to where the smoothed
+        // pressure actually left the baseline. The accelerometer-only
+        // window can extend back through calm flat-water riding before
+        // the pop (airtime inflated by seconds - the 2026-09-11 test
+        // session showed 8 s "airtimes" for ~2 s jumps). The baseline
+        // above stays computed from the pre-refinement takeoff, which
+        // is what we want: it samples the pre-jump riding level.
+        var dipStartTs = _pendTakeoffTs;
+        for (var si = 0; si < sm.size(); si++) {
+            var s = sm[si];
+            if (s[:when] > _pendTakeoffTs && s[:when] <= _pendLandingTs
+                    && s[:pa] <= basePa - DIP_START_PA) {
+                dipStartTs = s[:when];
+                break;
+            }
+        }
+        // Never push the takeoff later than landing - MIN_FLIGHT_MS so
+        // refinement cannot shrink a real jump below the airtime gate.
+        var capTs = _pendLandingTs - MIN_FLIGHT_MS;
+        if (dipStartTs > capTs) {
+            dipStartTs = capTs;
+        }
+        if (dipStartTs > _pendTakeoffTs) {
+            Logger.info("detector: takeoff refined "
+                + (_pendLandingTs - _pendTakeoffTs) + "ms -> "
+                + (_pendLandingTs - dipStartTs) + "ms");
+            _pendTakeoffTs = dipStartTs;
+            _pendAirtimeMs = _pendLandingTs - dipStartTs;
+        }
+
         // Return check: the latest post-landing smoothed sample must be
         // back near the baseline. This is the gate that rejects tack
         // ram-air drift (pressure steps down and STAYS down).
@@ -453,6 +496,42 @@ class JumpDetector {
         if (drift > BARO_RETURN_PA) {
             _discardCandidate(when, "noReturn drift=" + drift);
             return;
+        }
+
+        // GPS speed gate: real jumps only happen from riding speed.
+        // The last two fixes at/before takeoff (+1 s slack for the 1 Hz
+        // fix rate) must show ground speed >= TAKEOFF_SPEED_MPS. With
+        // no usable fix pair (GPS dropout) the gate is skipped rather
+        // than discarding real jumps.
+        var positions = _aggregator.getRecentPositions(32);
+        var pALat = 0.0f;
+        var pALon = 0.0f;
+        var pAWhen = 0;
+        var pBLat = 0.0f;
+        var pBLon = 0.0f;
+        var pBWhen = 0;
+        var fixCount = 0;
+        for (var pi = 0; pi < positions.size(); pi++) {
+            if (positions[pi][:when] <= _pendTakeoffTs + 1000) {
+                pALat = pBLat;
+                pALon = pBLon;
+                pAWhen = pBWhen;
+                pBLat = positions[pi][:lat];
+                pBLon = positions[pi][:lon];
+                pBWhen = positions[pi][:when];
+                fixCount++;
+            }
+        }
+        if (fixCount >= 2) {
+            var pdt = pBWhen - pAWhen;
+            if (pdt > 0 && pdt <= 10000) {
+                var pdist = _haversineMeters(pALat, pALon, pBLat, pBLon);
+                var speed = pdist.toFloat() / (pdt.toFloat() / 1000.0);
+                if (speed < TAKEOFF_SPEED_MPS) {
+                    _discardCandidate(when, "slowAtTakeoff speed=" + speed.format("%.1f"));
+                    return;
+                }
+            }
         }
 
         _recordJump(when, basePa, minPa, peakTs, dip);
@@ -484,7 +563,7 @@ class JumpDetector {
         var tLat = 0.0f;
         var tLon = 0.0f;
         var haveTakeoff = false;
-        var positions = _aggregator.getRecentPositions(8);
+        var positions = _aggregator.getRecentPositions(32);
         for (var pi = 0; pi < positions.size(); pi++) {
             var p = positions[pi];
             if (p[:when] <= _pendTakeoffTs + 1000) {
@@ -521,6 +600,7 @@ class JumpDetector {
                 "JUMP LANDED airtimeS=" + airtimeS.format("%.2f")
                 + " lengthM=" + lengthM
                 + " peakDeltaPa=" + dip
+                + " baselinePa=" + basePa
                 + " landingPath=impact"
             );
         } catch (e) {

@@ -69,10 +69,13 @@ function feedValidJump(det, agg, tEdge, airtimeMs, basePa, dipPa) {
     // Quiet flight with freefall evidence.
     feedFlight(det, flightStart, landingTs);
 
-    // Pressure: baseline before takeoff, dip during flight.
+    // Pressure: baseline before takeoff, gradual dip during flight
+    // (an early 12 Pa sample >= DIP_START_PA anchors the takeoff
+    // refinement, then the full dip).
     agg.pushPressure(basePa, flightStart - 3000);
     agg.pushPressure(basePa, flightStart - 2000);
     agg.pushPressure(basePa, flightStart - 1000);
+    agg.pushPressure(basePa - 12, flightStart + 200);
     agg.pushPressure(basePa - dipPa, flightStart + airtimeMs / 2);
     if (airtimeMs >= 1000) {
         agg.pushPressure(basePa - dipPa, flightStart + airtimeMs - 300);
@@ -109,10 +112,10 @@ function testDetectsJump(logger as Test.Logger) as Boolean {
         return false;
     }
 
-    // Airtime is takeoff (window start, first flight sample after the
-    // pop) to the landing trigger: 1600 ms of flight + 100 ms spike.
+    // Airtime is the refined takeoff (dip start ~200 ms into the
+    // 1600 ms flight) to the landing trigger: ~1500 ms.
     var durationMs = jump[:durationMs] as Number;
-    if (durationMs < 1400 || durationMs > 1900) {
+    if (durationMs < 1300 || durationMs > 1900) {
         logger.debug("testDetectsJump: unexpected durationMs=" + durationMs);
         return false;
     }
@@ -437,5 +440,113 @@ function testSplashOutlierKilledByMedian(logger as Test.Logger) as Boolean {
         return false;
     }
     logger.debug("testSplashOutlierKilledByMedian: heightM=" + heightM);
+    return true;
+}
+
+// Stationary rider regression (2026-09-11 session, jumps 1-2): a
+// rider standing/wading in the water gets kite-yank wrist spikes and
+// port-dunk pressure dips that pass every accelerometer/baro gate.
+// The GPS speed gate must reject them: two identical fixes before
+// takeoff = 0 m/s.
+(:test)
+function testStationaryRiderRejected(logger as Test.Logger) as Boolean {
+    var agg = new SensorAggregator();
+    var det = new JumpDetector(agg);
+
+    var landingTs = feedValidJump(det, agg, 2000, 1600, 101325, 35);
+
+    // Post-landing pressure back at baseline.
+    agg.pushPressure(101325, landingTs + 600);
+    agg.pushPressure(101325, landingTs + 1000);
+
+    // Two identical GPS fixes (rider stationary) before takeoff.
+    agg.pushPosition(45.0 as Double, -73.0 as Double, 3000);
+    agg.pushPosition(45.0 as Double, -73.0 as Double, 3500);
+
+    det.tick(landingTs + 1600);
+
+    var jump = det.getLastJump();
+    if (jump != null) {
+        logger.debug("testStationaryRiderRejected: stationary fake recorded: " + jump);
+        return false;
+    }
+    logger.debug("testStationaryRiderRejected: stationary rider rejected");
+    return true;
+}
+
+// Jump length regression (2026-09-11 session: lengthM=0.00 on every
+// jump because positions were stamped with the GPS epoch clock while
+// the detector compares System.getTimer() milliseconds). With the
+// clocks aligned, the takeoff position (last fix at/before takeoff)
+// and the landing position must produce a positive length.
+(:test)
+function testJumpLengthRecorded(logger as Test.Logger) as Boolean {
+    var agg = new SensorAggregator();
+    var det = new JumpDetector(agg);
+
+    var landingTs = feedValidJump(det, agg, 2000, 1600, 101325, 35);
+
+    // Post-landing pressure back at baseline.
+    agg.pushPressure(101325, landingTs + 600);
+    agg.pushPressure(101325, landingTs + 1000);
+
+    // Moving rider: two pre-takeoff fixes ~4 m/s apart, then a landing
+    // fix ~23 m downwind.
+    agg.pushPosition(45.0 as Double, -73.0 as Double, 2000);
+    agg.pushPosition(45.00003 as Double, -73.00003 as Double, 3100);
+    agg.pushPosition(45.0002 as Double, -73.0002 as Double, landingTs + 400);
+
+    det.tick(landingTs + 1600);
+
+    var jump = det.getLastJump();
+    if (jump == null) {
+        logger.debug("testJumpLengthRecorded: no jump recorded");
+        return false;
+    }
+    var lengthM = jump[:lengthM] as Number;
+    if (lengthM == null || lengthM.toFloat() <= 0.0) {
+        logger.debug("testJumpLengthRecorded: lengthM not recorded: " + lengthM);
+        return false;
+    }
+    logger.debug("testJumpLengthRecorded: lengthM=" + lengthM);
+    return true;
+}
+
+// Accelerometer batch timestamps (2026-09-14 regression): the streaming
+// listener delivers one second of samples per callback. Stamping them
+// all with the arrival instant would collapse every window the detector
+// walks backwards through, so the batch is spread backwards at the
+// sample interval.
+(:test)
+function testBatchSampleTimeMonotone(logger as Test.Logger) as Boolean {
+    var n = 25;
+    var rate = 25;
+    var now = 100000;
+
+    var prev = -1;
+    for (var i = 0; i < n; i++) {
+        var t = batchSampleTime(now, n, i, rate);
+        if (t <= prev) {
+            logger.debug("testBatchSampleTimeMonotone: not increasing at i=" + i
+                + " t=" + t + " prev=" + prev);
+            return false;
+        }
+        prev = t;
+    }
+
+    if (batchSampleTime(now, n, n - 1, rate) != now) {
+        logger.debug("testBatchSampleTimeMonotone: last sample not at now");
+        return false;
+    }
+    if (batchSampleTime(now, n, 0, rate) != now - 960) {
+        logger.debug("testBatchSampleTimeMonotone: first sample at "
+            + batchSampleTime(now, n, 0, rate) + " expected " + (now - 960));
+        return false;
+    }
+    // A single-sample batch must land exactly on the arrival instant.
+    if (batchSampleTime(now, 1, 0, rate) != now) {
+        logger.debug("testBatchSampleTimeMonotone: single-sample batch misplaced");
+        return false;
+    }
     return true;
 }

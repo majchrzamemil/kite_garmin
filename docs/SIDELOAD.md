@@ -65,6 +65,38 @@ If the watch does not mount as a drive on your Mac, use [OpenMTP](https://openmt
 
 ---
 
+## 2b. Dev builds vs. the Connect IQ beta
+
+The app is published as a Connect IQ beta under the application id in
+`manifest.xml`. A side-load built from that same manifest carries the same id
+and **replaces the beta on the watch**. Use the dev variant instead:
+
+```bash
+./build.sh --dev          # -> build/app-dev.prg, id from manifest-dev.xml
+```
+
+`manifest-dev.xml` differs from `manifest.xml` only in the application id and
+the app name (`Kite Tracker Dev`). Keep every other field in lock-step. The two
+installs then coexist as separate entries in the watch's app list.
+
+Copy it under its own name so its log file is distinct:
+
+```bash
+APPS_DIR="/Volumes/GARMIN/GARMIN/Apps"
+cp build/app-dev.prg "$APPS_DIR/appdev.prg"
+touch "$APPS_DIR/LOGS/APPDEV.TXT"      # log name = uppercase PRG base name
+```
+
+> **Always run `dot_clean -m /Volumes/GARMIN` after copying.** macOS writes
+> AppleDouble sidecars (`._appdev.prg`) that the watch tries to load as apps;
+> they are the source of every `Signature check failed on file: ._app` entry in
+> `GARMIN/Apps/LOGS/CIQ_LOG.YML`.
+
+`./build.sh -e` refuses to run with `--dev` so a dev id can never be packaged
+for the store.
+
+---
+
 ## 3. Copy the `.prg` to the correct `GARMIN/Apps/` folder
 
 > **Important:** On the Instinct Solar 2 the correct path is `/Volumes/GARMIN/GARMIN/Apps/`, not `/Volumes/GARMIN/Apps/`. The top-level `/Volumes/GARMIN/Apps/` folder is ignored by the watch.
