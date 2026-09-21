@@ -67,9 +67,9 @@ function testPositionBuffer(logger as Test.Logger) as Boolean {
 
     Test.assert(agg.getPositionCount() == 0);
 
-    agg.pushPosition(45.0 as Double, -73.0 as Double, 100);
-    agg.pushPosition(45.0001 as Double, -73.0001 as Double, 200);
-    agg.pushPosition(45.0002 as Double, -73.0002 as Double, 300);
+    agg.pushPosition(45.0 as Double, -73.0 as Double, 100, -1.0f);
+    agg.pushPosition(45.0001 as Double, -73.0001 as Double, 200, -1.0f);
+    agg.pushPosition(45.0002 as Double, -73.0002 as Double, 300, -1.0f);
 
     Test.assert(agg.getPositionCount() == 3);
 
@@ -118,7 +118,7 @@ function testRingOverwrite(logger as Test.Logger) as Boolean {
 
     var gTotal = (SensorAggregator.GPS_CAPACITY * 2) + 4;
     for (var i = 0; i < gTotal; i++) {
-        agg.pushPosition((i.toDouble()) * 0.0001, 0.0 as Double, i);
+        agg.pushPosition((i.toDouble()) * 0.0001, 0.0 as Double, i, -1.0f);
     }
     Test.assert(agg.getPositionCount() == SensorAggregator.GPS_CAPACITY);
 

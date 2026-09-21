@@ -4,17 +4,17 @@
 // instantiates it once on launch and drives its lifecycle through
 // onStart / onStop / onSleep / onWake.
 //
-// Phase 2 wires up the sensor pipeline: accelerometer (polled via the
-// legacy Toybox.Sensor.getInfo API at 40 Hz using a Timer, because
-// registerSensorDataListener crashes on Connect IQ 6.0.2 devices such
-// as the Instinct Solar 2), barometric pressure (read from the same
-// Sensor.getInfo() snapshot — raw ambient pressure, not the MSL-
-// compensated value returned by SensorHistory.getPressureHistory()),
-// and GPS (via Position.enableLocationEvents). All three streams are
-// pushed into a SensorAggregator with rolling buffers; the JumpDetector
-// (phase 2 step 2) will read from that aggregator.
+// Phase 2 wires up the sensor pipeline: accelerometer (streamed via
+// Sensor.registerSensorDataListener in 1 s batches at 25 Hz, with a
+// legacy getInfo() poll loop as fallback), barometric pressure (raw
+// ambient pressure from Activity.getActivityInfo(), polled at 4 Hz —
+// not the MSL-compensated value returned by
+// SensorHistory.getPressureHistory()), and GPS (via
+// Position.enableLocationEvents). All three streams are pushed into a
+// SensorAggregator with rolling buffers; the JumpDetector (phase 2
+// step 2) reads from that aggregator.
 //
-// Phase 3 swaps AppView for the session UI and adds FIT export.
+// Phase 3 swaps in the session UI and adds FIT export.
 
 import Toybox.Activity;
 import Toybox.Application;
@@ -34,6 +34,17 @@ class App extends Application.AppBase {
     // at registration time. 25 Hz is what every JumpDetector threshold
     // is written against.
     static const ACCEL_RATE_HZ = 25;
+
+    // Pressure poll period. The barometer's true update rate is unknown
+    // and was never measured, so we poll faster than 1 Hz and store only
+    // changed readings: if the sensor really is 1 Hz we get the same
+    // series as before, and if it is faster every baro gate gets more
+    // samples to work with. BARO_STATS reports distinct vs total.
+    static const PRESSURE_PERIOD_MS = 250;
+
+    // A reading identical to the previous one is still stored once this
+    // long has passed, so the series never goes stale during a plateau.
+    static const PRESSURE_STALE_MS  = 1000;
 
     var _aggregator as SensorAggregator;
     var _detector as JumpDetector;
@@ -67,6 +78,8 @@ class App extends Application.AppBase {
     var _paMax as Number;
     var _paMaxStep as Number;
     var _paLast as Number;
+    var _paPolls as Number;
+    var _paLastPushMs as Number;
 
     function initialize() {
         AppBase.initialize();
@@ -97,6 +110,8 @@ class App extends Application.AppBase {
         _paMax = 0;
         _paMaxStep = 0;
         _paLast = 0;
+        _paPolls = 0;
+        _paLastPushMs = 0;
         _resetSensorStats();
         Logger.info("App.initialize: done");
     }
@@ -157,15 +172,15 @@ class App extends Application.AppBase {
             Logger.warn("pipeline: Sensor module not available");
         }
 
-        // Pressure is read via Activity.getActivityInfo() at 1 Hz from
-        // a dedicated timer. SensorHistory.getPressureHistory() on the
+        // Pressure is read via Activity.getActivityInfo() from a
+        // dedicated timer (see PRESSURE_PERIOD_MS). SensorHistory.getPressureHistory() on the
         // Instinct Solar 2 returns GPS-altitude-compensated MSL
         // pressure, which stays nearly flat during a jump. Raw ambient
         // pressure from the barometer changes ~12 Pa per metre of
         // altitude, which is what the height calculation needs.
         _pressureTimer = new Timer.Timer();
-        _pressureTimer.start(method(:pollPressure), 1000, true); // 1 Hz
-        Logger.info("pipeline: pressure polling timer started");
+        _pressureTimer.start(method(:pollPressure), PRESSURE_PERIOD_MS, true);
+        Logger.info("pipeline: pressure polling every " + PRESSURE_PERIOD_MS + "ms");
 
         // GPS. LOCATION_CONTINUOUS keeps the receiver warm at ~1 Hz so
         // jump segments can be reconstructed between fixes.
@@ -289,7 +304,7 @@ class App extends Application.AppBase {
         var info = Sensor.getInfo();
         if (info == null) { return; }
 
-        // Pressure is read in pollPressure() at 1 Hz via the
+        // Pressure is read in pollPressure() (4 Hz) via the
         // Activity.getActivityInfo() dual API. Do not push pressure
         // from here; that would double-write the aggregator.
 
@@ -327,27 +342,50 @@ class App extends Application.AppBase {
         // values (baseline/dip/drift) are carried by the detector's
         // JUMP CANDIDATE / discard / LANDED lines instead.
 
+        var now = System.getTimer();
         if (rawPa != null) {
             var pa = rawPa.toNumber();
-            _aggregator.pushPressure(pa, System.getTimer());
-            _accumBaroStats(pa);
+            _paPolls++;
+            // Store only changed readings. Polling a 1 Hz sensor at 4 Hz
+            // would otherwise write four copies of each value, and the
+            // detector's "second-lowest flight sample" splash guard
+            // needs distinct samples to be meaningful.
+            if (pa != _paLast || now - _paLastPushMs >= PRESSURE_STALE_MS) {
+                _aggregator.pushPressure(pa, now);
+                _paLastPushMs = now;
+                _accumBaroStats(pa);
+            }
         }
-        _detector.tick(System.getTimer());
+        _detector.tick(now);
     }
 
     function onPosition(info as Position.Info) as Void {
-        if (info == null) {
+        // Drop unusable fixes instead of storing (0, 0). A no-fix
+        // callback used to be pushed like a real position, which both
+        // poisoned jump length and read as 0 m/s in the detector's
+        // takeoff-speed gate - two of them in a row would have
+        // discarded every candidate.
+        if (info == null || info.position == null) {
             return;
         }
-        var lat = info.position != null ? info.position.toDegrees()[0] : 0.0;
-        var lon = info.position != null ? info.position.toDegrees()[1] : 0.0;
+        if (info has :accuracy && info.accuracy != null
+                && info.accuracy < Position.QUALITY_USABLE) {
+            return;
+        }
+        var degrees = info.position.toDegrees();
+        var lat = degrees[0];
+        var lon = degrees[1];
+        var speed = -1.0f;
+        if (info has :speed && info.speed != null) {
+            speed = info.speed.toFloat();
+        }
         // Stamp the fix with System.getTimer() (the same clock the
         // detector and accelerometer samples use), NOT the GPS
         // Time.Moment. Mixing the two clocks made every position
         // timestamp incomparable with jump timestamps, so jump length
         // always computed to 0 (2026-09-11 session: lengthM=0.00 on
         // every jump).
-        _aggregator.pushPosition(lat, lon, System.getTimer());
+        _aggregator.pushPosition(lat, lon, System.getTimer(), speed);
     }
 
     // --- Per-session sensor statistics -------------------------------
@@ -363,6 +401,8 @@ class App extends Application.AppBase {
         _paMax      = 0;
         _paMaxStep  = 0;
         _paLast     = 0;
+        _paPolls    = 0;
+        _paLastPushMs = 0;
     }
 
     function _accumAccelStats(x as Float, y as Float, z as Float) as Void {
@@ -396,8 +436,8 @@ class App extends Application.AppBase {
         }
         var endTs = jump[:endTs];
         if (endTs == null || endTs <= _lastJumpEndTs) {
-            // Already-seen (or already-consumed) jump. This runs at the
-            // 40 Hz accel rate - logging here would flood the tiny
+            // Already-seen (or already-consumed) jump. This runs on
+            // every sensor callback - logging here would flood the tiny
             // on-device log and rotate the useful lines away.
             return;
         }
@@ -421,15 +461,15 @@ class App extends Application.AppBase {
         jump[:recorded] = recorded;
 
         if (!recorded) {
-            // SessionManager filtered this jump (e.g. baro heightM <= 1.5m
-            // threshold). It stays in _sessionJumps with :recorded=false
+            // SessionManager sanity-dropped this jump (baro heightM above
+            // the 20 m cap). It stays in _sessionJumps with :recorded=false
             // for diagnostic dumps; SessionReviewView filters it out.
             // Skip per-jump UI bookkeeping and never push SummaryView.
             Logger.info("ui: jump filtered (heightM=" + jump[:heightM] + "m), not showing popup");
             return;
         }
 
-        // Accumulate airtime for the DoneView summary.
+        // Accumulate airtime for the end-of-session summary.
         var duration = jump.get(:durationMs);
         if (duration == null) { duration = 0; }
         _totalAirtimeMs += duration.toNumber();
@@ -508,6 +548,12 @@ class App extends Application.AppBase {
         _sessionJumps = [] as Array<Dictionary>;
         _sessionStartMs = System.getTimer();
         _resetSensorStats();
+        // Clear sensor rings and detector state so a begin/end/begin
+        // cycle never starts mid-COASTING with the previous session's
+        // timestamps still in the buffers.
+        _aggregator.reset();
+        _detector.reset();
+        _lastJumpEndTs = 0;
         // Switch to SessionView BEFORE starting sensors so the UI
         // thread has settled before accelerometer/GPS callbacks can
         // fire. This avoids the "IQ!" race observed in the field.
@@ -538,7 +584,7 @@ class App extends Application.AppBase {
         _pendingJump = null;
         var airtimeS = (_totalAirtimeMs.toFloat()) / 1000.0;
         // Dump the full session log block (and write the storage
-        // backup) before switching to DoneView so the user sees the
+        // backup) before switching to the review view so the user sees the
         // summary while the log is already on disk.
         Logger.info("App.endSession: before _dumpSession");
         _dumpSession();
@@ -592,11 +638,9 @@ class App extends Application.AppBase {
             }
         }
 
-        // Record the detector's final state at end of session. If we
-        // ended while still AIRBORNE the jump was never closed (no
-        // landing path fired, possibly within the 30 s safety window);
-        // this line makes that visible in the log without having to
-        // scroll through JUMP AIRBORNE entries.
+        // Record the detector's final state at end of session. Ending
+        // in PENDING means a candidate was still waiting for its
+        // post-landing pressure window when the user stopped.
         Logger.info(
             "App._dumpSession: stateAtEnd=" + _detector.getStateName()
             + " recordedJumps=" + _sessionManager.getJumpCount()
@@ -704,10 +748,30 @@ class App extends Application.AppBase {
         );
         Logger.info(
             "BARO_STATS"
-            + " n=" + _paCount
+            + " polls=" + _paPolls
+            + " stored=" + _paCount
             + " minPa=" + _paMin
             + " maxPa=" + _paMax
             + " maxStepPa=" + _paMaxStep
+        );
+        // Which gate rejected what. Per-event warnings rotate out of the
+        // tiny on-device log long before a session is reviewed; this one
+        // line survives and tells a 0-jump session apart from a
+        // 0-recorded-jump one.
+        var dc = _detector.getDiscardCounts();
+        Logger.info(
+            "DISCARD_TALLY"
+            + " noHistory=" + dc[JumpDetector.DISCARD_NO_HISTORY]
+            + " noQuietWindow=" + dc[JumpDetector.DISCARD_NO_QUIET_WINDOW]
+            + " shortWindow=" + dc[JumpDetector.DISCARD_SHORT_WINDOW]
+            + " noReducedG=" + dc[JumpDetector.DISCARD_NO_REDUCED_G]
+            + " noPressure=" + dc[JumpDetector.DISCARD_NO_PRESSURE]
+            + " noBaseline=" + dc[JumpDetector.DISCARD_NO_BASELINE]
+            + " noFlightPa=" + dc[JumpDetector.DISCARD_NO_FLIGHT_PA]
+            + " noDip=" + dc[JumpDetector.DISCARD_NO_DIP]
+            + " noReturn=" + dc[JumpDetector.DISCARD_NO_RETURN]
+            + " slowAtTakeoff=" + dc[JumpDetector.DISCARD_SLOW_TAKEOFF]
+            + " skippedSanity=" + _sessionManager.getSkippedSanity()
         );
 
         Logger.info(
@@ -738,28 +802,4 @@ function batchSampleTime(nowMs as Number, n as Number, i as Number,
 function _codeToLandingPath(code as Number) as String {
     if (code == 0) { return "impact"; }
     return "unknown";
-}
-
-// The simplest possible Connect IQ view: paint a centered "Hello" string.
-// Replaced in phase 3 by the session UI.
-
-class AppView extends WatchUi.View {
-
-    function initialize() {
-        View.initialize();
-    }
-
-    function onUpdate(dc as Graphics.Dc) as Void {
-        dc.setColor(Graphics.COLOR_BLACK, Graphics.COLOR_BLACK);
-        dc.clear();
-
-        dc.setColor(Graphics.COLOR_WHITE, Graphics.COLOR_TRANSPARENT);
-        dc.drawText(
-            dc.getWidth() / 2,
-            dc.getHeight() / 2,
-            Graphics.FONT_MEDIUM,
-            "Kite Tracker",
-            Graphics.TEXT_JUSTIFY_CENTER
-        );
-    }
 }

@@ -15,20 +15,19 @@ kite jumps from the on-wrist accelerometer, barometer, and GPS.
   pre-impact window: the flight must be a *quiet* accelerometer
   window (riding chop stops when you leave the water) of 0.8–8 s
   containing at least one reduced-G sample (< 0.9 G), and the
-  median-of-3 smoothed barometer must show a **dip-and-return**
+  barometer must show a **dip-and-return**
   shape — ≥ 18 Pa below the pre-takeoff baseline during flight and
   back within 30 Pa of it after landing. The return check is what
-  rejects tack ram-air drift; the median kills single-sample splash
+  rejects tack ram-air drift and the wet-port decay; using the
+  second-lowest flight sample kills single-sample splash
   spikes.
-- After each recorded jump, `SessionManager.addJumpLap` checks the
-  barometric height against a 1.2 m gate and the airtime against a
-  0.75 s gate; jumps that pass are written as a FIT lap and trigger a
-  short `SummaryView` popup showing a large centred height with the
-  proper `m` suffix. A sanity discard rejects any landed jump whose
-  barometric height exceeds 20 m or whose takeoff-to-landing distance
-  exceeds 100 m — neither value is a realistic kiteboarding jump on a
-  wrist-mounted sensor, and the discard prevents splash/weather-driven
-  pressure outliers from polluting the FIT file.
+- Each validated jump is written as a FIT lap and triggers a short
+  `SummaryView` popup showing a large centred height with the proper
+  `m` suffix. `SessionManager.addJumpLap` applies only sanity caps
+  (barometric height above 20 m drops the lap — a corrupt pressure
+  series, not a jump; an implausible length is clamped instead of
+  dropping the jump). The real gates live in `JumpDetector` so the
+  two cannot drift apart.
 - Press **START** to end the session. The `SessionReviewView` lists
   every recorded jump one per screen; UP/DOWN scrolls the list,
   BACK exits. The FIT activity syncs to Garmin Connect and each jump
@@ -41,17 +40,26 @@ kite jumps from the on-wrist accelerometer, barometer, and GPS.
 
 | Sensor | Source | Rate |
 |--------|--------|------|
-| Accelerometer | `Sensor.getInfo().accel` | polled via `Timer` at 40 Hz |
-| Barometric pressure | `Activity.getActivityInfo().rawAmbientPressure` | polled via `Timer` at 1 Hz |
+| Accelerometer | `Sensor.registerSensorDataListener` | streamed in 1 s batches at 25 Hz |
+| Barometric pressure | `Activity.getActivityInfo().rawAmbientPressure` | polled via `Timer` at 4 Hz, only changed readings stored |
 | GPS position + speed | `Position.enableLocationEvents(LOCATION_CONTINUOUS)` | ~1 Hz |
 
 Note: `Sensor.getInfo().pressure` is MSL-calibrated and was rejected.
 The raw ambient pressure from the activity session is what we want
 because it changes with altitude (~12 Pa / metre).
 
-`Sensor.registerSensorDataListener` (API 2.3.0) crashes on Connect IQ
-6.0.2 devices including the Instinct Solar 2, so the accelerometer
-runs on the legacy `Sensor.getInfo()` poll loop instead.
+`Sensor.getInfo().accel` was used until 2026-09-15 and is a **cached
+snapshot refreshed roughly once a second**, not a stream. Polling it at
+40 Hz simply re-read the same value ~40 times: a 44-minute session
+produced three landing-spike triggers and a window minimum that never
+fell below 1.09 G, so no jump could ever clear the reduced-G gate.
+
+The streaming listener was previously believed to crash on Connect IQ
+6.0.2, but both recorded crashes were this app's own misuse -
+dictionary access instead of `data.accelerometerData`, and treating the
+batched `x`/`y`/`z` `Array<Number>` as scalars. With both fixed it runs
+clean. A `try`/`catch` around registration falls back to the old poll
+loop, and the session log records which path is live.
 
 ### Algorithm — landing-first jump detection
 
@@ -85,16 +93,16 @@ cleanest wrist signal in kiteboarding, so it is the trigger.
    with a short (`DISCARD_COAST_MS = 300` ms) cooldown so a pop spike
    does not blind the detector to the real landing that follows.
 4. **PENDING confirmation window.** A candidate is held for
-   `PENDING_MS = 1500` ms after the landing so post-landing
-   barometer samples arrive at the 1 Hz poll rate.
+   `PENDING_MS = 2600` ms after the landing so at least two
+   post-landing barometer samples arrive.
 5. **Barometric dip-and-return gate (`_maybeCompletePending`).** On
-   the median-of-3 smoothed pressure series: the baseline is the
+   the raw pressure series: the baseline is the
    median of samples in `[takeoff − 4 s, takeoff − 0.5 s]`; the
    flight must dip ≥ `BARO_DIP_PA = 18` Pa below it; and the latest
-   post-landing sample must be back within `BARO_RETURN_PA = 30` Pa
+   post-landing sample closest to baseline must be within `BARO_RETURN_PA = 30` Pa
    of it. The return check is what rejects tack ram-air drift
    (pressure steps down through a turn and *stays* down). The
-   median-of-3 smoothing kills single-sample splash spikes of any
+   taking the second-lowest flight sample kills single-sample splash spikes of any
    size — the old `SPLASH_OUTLIER_PA` constant is gone.
 6. **No watchdog.** There is no persistent AIRBORNE state to get
    stuck: a candidate that fails any gate is discarded, never
@@ -107,22 +115,70 @@ confirmation) → `COASTING` → `ARMED`.
 
 ### Record gate (`SessionManager.addJumpLap`)
 
-All must hold for a validated jump to be written as a FIT lap:
+The detector owns the real thresholds (`BARO_DIP_PA`, `MIN_FLIGHT_MS`).
+Only sanity caps live here, so the two cannot drift apart:
 
-- `baroH > 1.2` m.
-- `airtimeS > 0.75` s.
-- Sanity caps: `baroH <= 20.0` m **and** `lengthM <= 100.0` m. A jump
-  whose barometric height exceeds 20 m or whose takeoff-to-landing
-  distance exceeds 100 m is logged and skipped — neither value is a
-  realistic kiteboarding jump on a wrist-mounted sensor.
+- `baroH > 20.0` m → the jump is **dropped**. No wrist-sensor
+  kiteboarding jump is 20 m; that value means the pressure series was
+  corrupt.
+- `lengthM > 100.0` m → the **length is clamped to 0**, the jump is
+  still recorded. An implausible length means GPS anchoring failed, not
+  that the jump was fake — the height and airtime are still good.
+  Dropping the whole lap here used to be invisible: the jump stayed in
+  the session list with `:recorded = false` and simply vanished from
+  the review screen.
 
-Jumps failing any of these are logged but never reach the FIT file
-and never trigger `SummaryView`.
+### Jump length — what it measures, and how well
+
+Length is the great-circle distance between two GPS fixes: the one
+nearest takeoff and the one nearest landing, each required to be within
+`POSITION_MATCH_MS = 2000` ms of its anchor. If neither side has a
+usable fix the jump records with `lengthM = 0.0` rather than a
+fabricated number.
+
+The GPS runs at about 1 Hz (confirmed on-device: 2642 fixes across a
+2660 s session), so both anchors carry up to ±0.5 s of timing slack.
+At a riding speed of 8 m/s that is **roughly ±5 m on a typical 10–25 m
+jump** — the right order of magnitude, not a precise measurement.
+Relative error between two fixes a second or two apart is much smaller
+than the receiver's absolute accuracy, which is what makes this usable
+at all.
+
+Two specific cases are handled:
+
+- **Jump shorter than the fix interval.** Both anchors can land on the
+  same fix, which would report 0 m. The jump is then bracketed instead
+  — last fix at or before takeoff, first at or after landing. That
+  overstates by up to one fix interval, but it is a measurement rather
+  than a zero.
+- **Pending latency.** `_recordJump` runs `PENDING_MS` after the
+  landing impact. Measuring to "the latest fix" therefore swept in
+  ~3.5 s of riding — 35–40 m at kite speeds, enough on its own to trip
+  the 100 m sanity cap on a genuine jump. Anchoring to landing fixes
+  that.
+
+### GPS — the other two jobs
+
+Beyond length, the GPS does two things:
+
+1. **Takeoff speed gate.** A jump only happens from riding speed, so a
+   candidate with a takeoff ground speed below `TAKEOFF_SPEED_MPS = 3.0`
+   m/s is discarded. This is what rejects kite-yank wrist spikes while
+   wading out or body-dragging. The speed comes from
+   `Position.Info.speed` (Doppler-derived) rather than from
+   differencing two fixes, because consecutive 1 Hz callbacks can repeat
+   the same position and read as 0 m/s. With no usable speed the gate
+   is skipped rather than dropping real jumps.
+2. **Fix validity.** Callbacks with no position, or accuracy below
+   `Position.QUALITY_USABLE`, are discarded outright. They used to be
+   stored as `(0, 0)`, which both poisoned length and would have read as
+   0 m/s in the speed gate above — two of those in a row would have
+   discarded every candidate in a session.
 
 ### Height
 
 Barometer-only. `h = 44330 * (1 - (P_min / P_0)^0.190263)` on the
-lowest *median-of-3 smoothed* Pa observed during flight vs the
+*second-lowest* raw Pa observed during flight vs the
 pre-takeoff baseline median (ICAO formula). The accelerometer-derived
 ascent/descent height that the project originally produced is no
 longer used — wrist motion during riding made the half-freefall
@@ -140,20 +196,20 @@ estimate too noisy on real data.
 | `MIN_FLIGHT_MS` | **800** | Shorter quiet window = chop slap, not a jump. |
 | `MAX_FLIGHT_MS` | **8000** | Backward scan cap (also the airtime ceiling). |
 | `FREEFALL_SOFT_G` | **0.90** | ≥ 1 sample below this in flight = weightlessness evidence. |
-| `BARO_DIP_PA` | **18** | Required smoothed dip below baseline during flight (~1.5 m). |
+| `BARO_DIP_PA` | **18** | Required dip below baseline during flight (~1.5 m). |
 | `BARO_RETURN_PA` | **30** | Post-landing sample must return this close to baseline. |
 | `BASELINE_BACK_MS` | 4000 | Baseline median window starts this far before takeoff. |
 | `BASELINE_GAP_MS` | 500 | Baseline median window ends this far before takeoff. |
-| `PENDING_MS` | 1500 | Post-landing wait for 1–2 fresh baro samples. |
-| `PRESSURE_LOOKBACK` | 20 | Pressure samples pulled from the ring at confirmation. |
+| `PENDING_MS` | **2600** | Post-landing wait for at least two fresh baro samples. |
+| `PRESSURE_LOOKBACK` | **80** | Pressure samples pulled from the ring at confirmation (~20 s at 4 Hz). |
 | `COAST_MS` | 1500 | Debounce after a recorded jump. |
 | `DISCARD_COAST_MS` | 300 | Short cooldown after a discarded event (e.g. a pop spike). |
-| `G_RING_CAPACITY` | 360 | Internal G-magnitude ring, ~9 s at the 40 Hz poll rate. |
+| `G_RING_CAPACITY` | 360 | Internal G-magnitude ring, ~14 s at the 25 Hz stream rate. |
 
-The final 1.2 m / 0.75 s / 20 m / 100 m record gate in
-`SessionManager.addJumpLap` is the last line of defence behind the
-detector-side gates (landing impact, quiet window, reduced-G
-sample, and the barometric dip-and-return shape).
+`SessionManager.addJumpLap` adds only the sanity caps described under
+"Record gate" above (drop above 20 m, clamp length above 100 m)
+behind the detector-side gates (landing impact, quiet window,
+reduced-G sample, and the barometric dip-and-return shape).
 
 ## Building
 
@@ -267,14 +323,13 @@ source/
   App.mc                  # entry point, sensor pipeline, session lifecycle
   AppInputDelegate.mc     # START / ENTER toggle
   SessionManager.mc       # ActivityRecording + FitContributor fields, FIT export
-  JumpDetector.mc         # state machine: IDLE -> ARMED -> AIRBORNE -> LANDING -> COASTING
+  JumpDetector.mc         # state machine: IDLE -> ARMED -> PENDING -> COASTING
   SensorAggregator.mc     # ring buffers for accel / pressure / GPS samples
   StartView.mc            # "Press START to begin"
   SessionView.mc          # "Recording... Jumps: N"
   SummaryView.mc          # big centred height popup after each recorded jump
   SessionReviewView.mc    # end-of-session scrollable review (UP/DOWN)
   SessionReviewInputDelegate.mc
-  DoneView.mc             # superseded by SessionReviewView (kept for now)
   Logger.mc               # [KITE] prefix wrapper around System.println
   test/
     SensorAggregatorTests.mc
@@ -320,9 +375,11 @@ Screenshot assets: `assets/screenshots/`
   data to the FIT file (download with FITCSVTool to inspect it) but
   Connect won't render the columns because the rendering metadata
   lives in the app-store JSON, not in the `.prg`.
-- **First-detected peaks may underestimate barometric height.** The
-  pressure sensor is polled at 1 Hz. For a fast jump (apex in less
-  than a second), we may sample the pressure only before and after
-  the peak and lose ~12 Pa / m of accuracy. The 1.5 m record gate
-  catches most of these cases by rejecting jumps whose peak pressure
-  delta does not produce a clear height above baseline.
+- **Short jumps may fail the baro dip gate.** The barometer's true
+  update rate is unmeasured; we poll at 4 Hz and store only changed
+  readings. If the sensor really updates at 1 Hz, a fast jump (apex
+  under a second) can leave fewer than two distinct flight samples,
+  and the second-lowest-sample splash guard then refuses to confirm
+  the dip. The `noDip` entry in the session-end `DISCARD_TALLY` line
+  counts these; a high value on a jump-heavy session means the
+  barometer needs a faster path.

@@ -30,13 +30,26 @@
 //                  the flight (weightlessness evidence).
 //   5. PENDING   - the candidate is held for PENDING_MS after landing
 //                  so post-landing barometer samples arrive.
-//   6. BARO      - median-of-3 smoothed pressure must show a
-//                  dip-then-RETURN shape: >= BARO_DIP_PA below the
-//                  pre-takeoff baseline during flight, and back within
-//                  BARO_RETURN_PA of the baseline after landing. A bare
-//                  "dropped 20 Pa sometime in 20 s" no longer exists —
-//                  the return check is what rejects tack ram-air drift.
-//   7. RECORD    - height from the ICAO formula on the smoothed dip.
+//   6. BARO      - raw pressure must show a dip-then-RETURN shape:
+//                  >= BARO_DIP_PA below the pre-takeoff baseline during
+//                  flight, and back within BARO_RETURN_PA of it after
+//                  landing. A bare "dropped 20 Pa sometime in 20 s" no
+//                  longer exists — the return check is what rejects tack
+//                  ram-air drift and the wet-port decay.
+//
+//                  The barometer produces occasional wildly corrupt
+//                  samples (water over the port: a +800 Pa spike then a
+//                  -1300 Pa plunge, measured 2026-09-14). Every one of
+//                  the three places pressure is read is hardened against
+//                  a single bad sample WITHOUT smoothing the series:
+//                    baseline - median over the pre-takeoff window
+//                    dip      - second-lowest sample in the flight
+//                    return   - post-landing sample closest to baseline
+//                  Smoothing was tried (median-of-3) and had to go: at
+//                  1 Hz it erased short jumps outright, since
+//                  median(B, B, D) = B.
+//   7. RECORD    - height from the ICAO formula on the second-lowest
+//                  flight sample.
 //
 // There is no AIRBORNE watchdog any more: a candidate that fails any
 // gate is discarded (short cooldown), never force-landed into the FIT
@@ -52,8 +65,9 @@
 //   COASTING - post-event debounce (COAST_MS after a recorded jump,
 //              DISCARD_COAST_MS after a discarded event).
 //
-// Accelerometer unit note: App.pollAccel() converts Sensor.getInfo()
-// .accel milli-g values to m/s^2 before calling onAccelSample()
+// Accelerometer unit note: App converts accelerometer milli-g values
+// to m/s^2 before calling onAccelSample(), on both the stream path
+// (onSensorData) and the poll fallback (pollAccel)
 // (verified against the Connect IQ docs: accel is in millig-units).
 
 import Toybox.Lang;
@@ -64,7 +78,7 @@ class JumpDetector {
     static const STATE_IDLE     = 0;
     static const STATE_ARMED    = 1;
     static const STATE_PENDING  = 2;
-    static const STATE_COASTING = 4;
+    static const STATE_COASTING = 3;
 
     // --- Landing impact trigger ---------------------------------------
     // A kiteboard landing yanks the wrist well above riding noise.
@@ -99,18 +113,24 @@ class JumpDetector {
     static const TAKEOFF_SPEED_MPS      = 3.0;
 
     // --- Barometric confirmation -------------------------------------
-    // Applied at PENDING completion to the median-of-3 smoothed 1 Hz
-    // pressure series. dip >= BARO_DIP_PA during flight AND the last
-    // post-landing sample within BARO_RETURN_PA of the pre-takeoff
-    // baseline. The return check is what rejects tack ram-air drift.
+    // Applied at PENDING completion to the raw pressure series.
+    // dip >= BARO_DIP_PA during flight AND a post-landing sample within
+    // BARO_RETURN_PA of the pre-takeoff baseline. The return check is
+    // what rejects tack ram-air drift and the wet-port decay.
     static const BARO_DIP_PA           = 18;
     static const BARO_RETURN_PA        = 30;
     static const BASELINE_BACK_MS      = 4000;
     static const BASELINE_GAP_MS       = 500;
-    static const PENDING_MS            = 1500;
-    static const PRESSURE_LOOKBACK     = 20;
 
-    // Takeoff refinement: the first smoothed flight sample at least
+    // Long enough for at least two post-landing pressure samples at the
+    // 1 Hz worst case, so the return check below has something real to
+    // compare against instead of falling back to the dip itself.
+    static const PENDING_MS            = 2600;
+
+    // ~20 s of history at the 4 Hz poll rate.
+    static const PRESSURE_LOOKBACK     = 80;
+
+    // Takeoff refinement: the first flight sample at least
     // this far below the baseline marks where the pressure excursion
     // began. The accelerometer-only window can extend back through
     // calm flat-water riding before the pop, inflating airtime by
@@ -121,17 +141,38 @@ class JumpDetector {
     static const COAST_MS              = 1500;
     static const DISCARD_COAST_MS      = 300;
 
+    // A GPS fix further than this from the moment it is meant to
+    // represent is not usable as a jump endpoint.
+    static const POSITION_MATCH_MS      = 2000;
+
     static const G_MS2                  = 9.80665;
 
-    // Internal G-magnitude ring. ~9 s at the 40 Hz poll rate, which
-    // also covers ~8 s of real flight when the sensor updates at 25 Hz
-    // (duplicate polls are stored; they are harmless for the scan).
+    // Internal G-magnitude ring. ~14 s at the 25 Hz stream rate,
+    // which covers the 8 s backward scan with margin (duplicate
+    // poll-loop samples are stored too; they are harmless for the
+    // scan).
     static const G_RING_CAPACITY       = 360;
 
     // Landing path codes (numeric to keep _lastJump strictly numeric —
     // see commit history for the mixed-type dictionary crash).
     // 0 = "impact" is the only production path in this design.
     static const LANDING_PATH_IMPACT    = 0;
+
+    // Discard reasons. Tallied per session and printed as one line at
+    // session end: APP.TXT rotates at a few KB, so per-event warnings
+    // are gone by the time a session is reviewed, and a 0-jump session
+    // then says nothing about which gate rejected everything.
+    static const DISCARD_NO_HISTORY      = 0;
+    static const DISCARD_NO_QUIET_WINDOW = 1;
+    static const DISCARD_SHORT_WINDOW    = 2;
+    static const DISCARD_NO_REDUCED_G    = 3;
+    static const DISCARD_NO_PRESSURE     = 4;
+    static const DISCARD_NO_BASELINE     = 5;
+    static const DISCARD_NO_FLIGHT_PA    = 6;
+    static const DISCARD_NO_DIP          = 7;
+    static const DISCARD_NO_RETURN       = 8;
+    static const DISCARD_SLOW_TAKEOFF    = 9;
+    static const DISCARD_REASON_COUNT    = 10;
 
     var _aggregator       as SensorAggregator;
     var _state            as Number;
@@ -147,6 +188,8 @@ class JumpDetector {
     var _pendLandingTs    as Number;
     var _pendAirtimeMs    as Number;
 
+    var _discardCounts    as Array<Number>;
+
     function initialize(aggregator as SensorAggregator) {
         _aggregator       = aggregator;
         _state            = STATE_IDLE;
@@ -159,12 +202,34 @@ class JumpDetector {
         _pendTakeoffTs    = 0;
         _pendLandingTs    = 0;
         _pendAirtimeMs    = 0;
+        _discardCounts    = new Array<Number>[DISCARD_REASON_COUNT];
+        for (var i = 0; i < DISCARD_REASON_COUNT; i++) { _discardCounts[i] = 0; }
+    }
+
+    // Clear all per-session state. Without this a begin/end/begin cycle
+    // starts in whatever state the previous session ended in, with its
+    // timestamps still in the rings.
+
+    function reset() as Void {
+        _state         = STATE_IDLE;
+        _spikeCount    = 0;
+        _ringCount     = 0;
+        _coastEndTs    = 0;
+        _lastJump      = null;
+        _pendTakeoffTs = 0;
+        _pendLandingTs = 0;
+        _pendAirtimeMs = 0;
+        for (var i = 0; i < DISCARD_REASON_COUNT; i++) { _discardCounts[i] = 0; }
+    }
+
+    function getDiscardCounts() as Array<Number> {
+        return _discardCounts;
     }
 
     // Returns the most recently completed jump metrics, or null if no
     // jump has landed yet this session. Dictionary keys:
     //   :durationMs   Number   (takeoff -> landing)
-    //   :heightM      Number   (barometric, ICAO on smoothed dip)
+    //   :heightM      Number   (barometric, ICAO on the flight dip)
     //   :lengthM      Number
     //   :airtimeS     Float
     //   :startTs      Number
@@ -231,7 +296,7 @@ class JumpDetector {
         }
     }
 
-    // Called by App.pollPressure() at 1 Hz so the PENDING confirmation
+    // Called by App.pollPressure() (4 Hz) so the PENDING confirmation
     // window advances even if no accel sample arrives, and the COASTING
     // debounce can expire.
 
@@ -291,7 +356,7 @@ class JumpDetector {
     function _analyzeLanding(when as Number) as Void {
         var V = _validCount();
         if (V < 4) {
-            _shortDiscard(when, "noHistory");
+            _shortDiscard(when, DISCARD_NO_HISTORY, "noHistory");
             return;
         }
 
@@ -330,7 +395,7 @@ class JumpDetector {
         }
 
         if (windowStart > i) {
-            _shortDiscard(when, "noQuietWindow");
+            _shortDiscard(when, DISCARD_NO_QUIET_WINDOW, "noQuietWindow");
             return;
         }
 
@@ -350,7 +415,7 @@ class JumpDetector {
         var takeoffTs = _ts(takeoffIdx);
         var airtimeMs = when - takeoffTs;
         if (airtimeMs < MIN_FLIGHT_MS) {
-            _shortDiscard(when, "shortWindow ms=" + airtimeMs);
+            _shortDiscard(when, DISCARD_SHORT_WINDOW, "shortWindow ms=" + airtimeMs);
             return;
         }
 
@@ -365,7 +430,7 @@ class JumpDetector {
             q++;
         }
         if (lowCount == 0) {
-            _shortDiscard(when, "noReducedG minG=" + minG.format("%.2f"));
+            _shortDiscard(when, DISCARD_NO_REDUCED_G, "noReducedG minG=" + minG.format("%.2f"));
             return;
         }
 
@@ -383,8 +448,15 @@ class JumpDetector {
 
     // Called from onAccelSample / tick once PENDING_MS has elapsed
     // after the landing impact. Runs the barometric dip-and-return
-    // confirmation over the median-of-3 smoothed pressure series and
-    // either records the jump or discards the candidate.
+    // confirmation over the raw pressure series and either records the
+    // jump or discards the candidate.
+    //
+    // This works on RAW samples, not a median-of-3 smoothed series. At
+    // 1 Hz a median-of-3 erases a single-sample dip completely -
+    // median(B, B, D) = B - so a short jump's only pressure evidence
+    // disappeared before the dip gate ever saw it. Splash spikes are
+    // rejected instead by taking the SECOND-smallest flight sample: a
+    // water-on-the-port outlier is one sample, a real dip is not.
 
     function _maybeCompletePending(when as Number) as Void {
         if (_state != STATE_PENDING) {
@@ -394,81 +466,139 @@ class JumpDetector {
             return;
         }
 
-        var sm = _smoothedPressureSeries();
-        if (sm == null || sm.size() < 3) {
-            _discardCandidate(when, "noPressureData");
+        var raws = _aggregator.getRecentPressure(PRESSURE_LOOKBACK);
+        if (raws.size() < 3) {
+            _discardCandidate(when, DISCARD_NO_PRESSURE, "noPressureData");
             return;
         }
 
-        // Baseline: median of smoothed samples in the pre-takeoff
-        // window [takeoff - BASELINE_BACK_MS, takeoff - BASELINE_GAP_MS].
+        // Baseline: median of the raw samples in the pre-takeoff window
+        // [takeoff - BASELINE_BACK_MS, takeoff - BASELINE_GAP_MS]. The
+        // median is already outlier-proof, so no pre-smoothing needed.
         var basePa = -1;
         var baseVals = [] as Array<Number>;
-        for (var si = 0; si < sm.size(); si++) {
-            var s = sm[si];
-            if (s[:when] >= _pendTakeoffTs - BASELINE_BACK_MS
-                    && s[:when] <= _pendTakeoffTs - BASELINE_GAP_MS) {
-                baseVals.add(s[:pa]);
+        for (var si = 0; si < raws.size(); si++) {
+            var r = raws[si];
+            if (r[:when] >= _pendTakeoffTs - BASELINE_BACK_MS
+                    && r[:when] <= _pendTakeoffTs - BASELINE_GAP_MS) {
+                baseVals.add(r[:pa]);
             }
         }
         if (baseVals.size() > 0) {
             basePa = _medianOf(baseVals);
         } else {
-            // Fallback: the last smoothed sample at or before takeoff.
-            for (var si = 0; si < sm.size(); si++) {
-                var s = sm[si];
-                if (s[:when] <= _pendTakeoffTs) {
-                    basePa = s[:pa];
+            // Fallback: median of the last few samples at or before
+            // takeoff. Never a single raw sample - one bad read would
+            // become the baseline every later gate is measured against.
+            var tail = [] as Array<Number>;
+            for (var si = 0; si < raws.size(); si++) {
+                var r = raws[si];
+                if (r[:when] <= _pendTakeoffTs) {
+                    tail.add(r[:pa]);
+                    if (tail.size() > 3) { tail = tail.slice(1, null); }
                 }
             }
-            if (basePa < 0) {
-                _discardCandidate(when, "noBaseline");
+            if (tail.size() == 0) {
+                _discardCandidate(when, DISCARD_NO_BASELINE, "noBaseline");
                 return;
             }
+            basePa = _medianOf(tail);
         }
 
-        // Flight: lowest smoothed pressure strictly after takeoff and
-        // up to the landing impact.
-        var minPa = -1;
-        var peakTs = 0;
-        for (var si = 0; si < sm.size(); si++) {
-            var s = sm[si];
-            if (s[:when] > _pendTakeoffTs && s[:when] <= _pendLandingTs) {
-                if (minPa < 0 || s[:pa] < minPa) {
-                    minPa = s[:pa];
-                    peakTs = s[:when];
+        // Flight window: the two lowest raw samples strictly after
+        // takeoff and up to the landing impact. minPa is the SECOND
+        // lowest when the window holds more than one sample, so a
+        // single splash outlier cannot set the height.
+        var lowest = -1;
+        var second = -1;
+        var lowestTs = 0;
+        var secondTs = 0;
+        var flightCount = 0;
+        for (var si = 0; si < raws.size(); si++) {
+            var r = raws[si];
+            if (r[:when] > _pendTakeoffTs && r[:when] <= _pendLandingTs) {
+                flightCount++;
+                var pa = r[:pa];
+                if (lowest < 0 || pa < lowest) {
+                    second = lowest;
+                    secondTs = lowestTs;
+                    lowest = pa;
+                    lowestTs = r[:when];
+                } else if (second < 0 || pa < second) {
+                    second = pa;
+                    secondTs = r[:when];
                 }
             }
         }
-        if (minPa < 0) {
-            _discardCandidate(when, "noFlightPressure");
+        if (flightCount == 0) {
+            _discardCandidate(when, DISCARD_NO_FLIGHT_PA, "noFlightPressure");
             return;
+        }
+
+        var minPa = lowest;
+        var peakTs = lowestTs;
+        if (flightCount > 1 && second >= 0) {
+            minPa = second;
+            peakTs = secondTs;
         }
 
         var dip = basePa - minPa;
         if (dip < BARO_DIP_PA) {
-            _discardCandidate(when, "noDip dip=" + dip);
+            _discardCandidate(when, DISCARD_NO_DIP,
+                "noDip dip=" + dip + " n=" + flightCount);
             return;
         }
 
-        // Takeoff refinement: anchor the takeoff to where the smoothed
-        // pressure actually left the baseline. The accelerometer-only
-        // window can extend back through calm flat-water riding before
-        // the pop (airtime inflated by seconds - the 2026-09-11 test
-        // session showed 8 s "airtimes" for ~2 s jumps). The baseline
-        // above stays computed from the pre-refinement takeoff, which
-        // is what we want: it samples the pre-jump riding level.
+        // Return check: pressure must come back to the pre-takeoff
+        // baseline after landing. This is the gate that rejects the
+        // wet-port signature - a +800 Pa spike, a -1300 Pa plunge, then
+        // a 15 s exponential decay that is still hundreds of Pa off
+        // baseline (measured on the 2026-09-14 session) - and the tack
+        // ram-air drift that steps down and STAYS down.
+        //
+        // Only a genuine post-landing sample counts. The old code
+        // seeded the comparison with minPa, so a candidate with no
+        // post-landing sample yet was measured against its own dip:
+        // the bigger the jump, the likelier the false rejection.
+        // Bad-read protection: take the post-landing sample CLOSEST to
+        // the baseline rather than the last one. A lone corrupt sample
+        // then cannot veto a jump whose pressure really did come back,
+        // and it cannot rescue a wet-port decay either - during a decay
+        // no sample is near baseline (the 2026-09-14 dunks were still
+        // 400+ Pa off two seconds after the event).
+        var drift = -1;
+        for (var si = 0; si < raws.size(); si++) {
+            var r = raws[si];
+            if (r[:when] > _pendLandingTs) {
+                var d = r[:pa] - basePa;
+                if (d < 0) { d = -d; }
+                if (drift < 0 || d < drift) { drift = d; }
+            }
+        }
+        if (drift < 0) {
+            _discardCandidate(when, DISCARD_NO_RETURN, "noReturn noPostLandingSample");
+            return;
+        }
+        if (drift > BARO_RETURN_PA) {
+            _discardCandidate(when, DISCARD_NO_RETURN, "noReturn drift=" + drift);
+            return;
+        }
+
+        // Takeoff refinement: anchor the takeoff to where the pressure
+        // actually left the baseline. The accelerometer-only window can
+        // extend back through calm flat-water riding before the pop
+        // (the 2026-09-11 session showed 8 s "airtimes" for ~2 s jumps).
+        // The baseline stays computed from the pre-refinement takeoff,
+        // which is what we want: it samples the pre-jump riding level.
         var dipStartTs = _pendTakeoffTs;
-        for (var si = 0; si < sm.size(); si++) {
-            var s = sm[si];
-            if (s[:when] > _pendTakeoffTs && s[:when] <= _pendLandingTs
-                    && s[:pa] <= basePa - DIP_START_PA) {
-                dipStartTs = s[:when];
+        for (var si = 0; si < raws.size(); si++) {
+            var r = raws[si];
+            if (r[:when] > _pendTakeoffTs && r[:when] <= _pendLandingTs
+                    && r[:pa] <= basePa - DIP_START_PA) {
+                dipStartTs = r[:when];
                 break;
             }
         }
-        // Never push the takeoff later than landing - MIN_FLIGHT_MS so
-        // refinement cannot shrink a real jump below the airtime gate.
         var capTs = _pendLandingTs - MIN_FLIGHT_MS;
         if (dipStartTs > capTs) {
             dipStartTs = capTs;
@@ -481,29 +611,35 @@ class JumpDetector {
             _pendAirtimeMs = _pendLandingTs - dipStartTs;
         }
 
-        // Return check: the latest post-landing smoothed sample must be
-        // back near the baseline. This is the gate that rejects tack
-        // ram-air drift (pressure steps down and STAYS down).
-        var retVal = minPa;
-        for (var si = 0; si < sm.size(); si++) {
-            var s = sm[si];
-            if (s[:when] > _pendLandingTs) {
-                retVal = s[:pa];
-            }
-        }
-        var drift = retVal - basePa;
-        if (drift < 0) { drift = -drift; }
-        if (drift > BARO_RETURN_PA) {
-            _discardCandidate(when, "noReturn drift=" + drift);
+        // GPS speed gate: real jumps only happen from riding speed. A
+        // stationary rider (wading out, body-dragging, water-start
+        // attempts) produces kite-yank spikes and port-dunk dips that
+        // otherwise pass every accelerometer/baro gate. With no usable
+        // speed sample the gate is skipped rather than dropping real
+        // jumps.
+        var takeoffSpeed = _speedNearTakeoff();
+        if (takeoffSpeed >= 0.0 && takeoffSpeed < TAKEOFF_SPEED_MPS) {
+            _discardCandidate(when, DISCARD_SLOW_TAKEOFF,
+                "slowAtTakeoff speed=" + takeoffSpeed.format("%.1f"));
             return;
         }
 
-        // GPS speed gate: real jumps only happen from riding speed.
-        // The last two fixes at/before takeoff (+1 s slack for the 1 Hz
-        // fix rate) must show ground speed >= TAKEOFF_SPEED_MPS. With
-        // no usable fix pair (GPS dropout) the gate is skipped rather
-        // than discarding real jumps.
+        _recordJump(when, basePa, minPa, peakTs, dip);
+    }
+
+    // Ground speed at takeoff, or -1.0 when GPS cannot answer.
+    //
+    // Prefers the speed the GPS reports directly; falls back to
+    // differencing the two fixes bracketing takeoff. The fallback only
+    // runs when no fix carries a speed, because differencing two 1 Hz
+    // fixes reads 0 m/s whenever consecutive callbacks repeat a
+    // position.
+
+    function _speedNearTakeoff() as Float {
         var positions = _aggregator.getRecentPositions(32);
+        var cutoff = _pendTakeoffTs + 1000;
+
+        var reported = -1.0f;
         var pALat = 0.0f;
         var pALon = 0.0f;
         var pAWhen = 0;
@@ -511,30 +647,32 @@ class JumpDetector {
         var pBLon = 0.0f;
         var pBWhen = 0;
         var fixCount = 0;
+
         for (var pi = 0; pi < positions.size(); pi++) {
-            if (positions[pi][:when] <= _pendTakeoffTs + 1000) {
-                pALat = pBLat;
-                pALon = pBLon;
-                pAWhen = pBWhen;
-                pBLat = positions[pi][:lat];
-                pBLon = positions[pi][:lon];
-                pBWhen = positions[pi][:when];
-                fixCount++;
-            }
+            var p = positions[pi];
+            if (p[:when] > cutoff) { continue; }
+            var sp = p[:speed];
+            if (sp != null && sp >= 0.0) { reported = sp; }
+            pALat = pBLat;
+            pALon = pBLon;
+            pAWhen = pBWhen;
+            pBLat = p[:lat];
+            pBLon = p[:lon];
+            pBWhen = p[:when];
+            fixCount++;
+        }
+
+        if (reported >= 0.0) {
+            return reported;
         }
         if (fixCount >= 2) {
             var pdt = pBWhen - pAWhen;
             if (pdt > 0 && pdt <= 10000) {
                 var pdist = _haversineMeters(pALat, pALon, pBLat, pBLon);
-                var speed = pdist.toFloat() / (pdt.toFloat() / 1000.0);
-                if (speed < TAKEOFF_SPEED_MPS) {
-                    _discardCandidate(when, "slowAtTakeoff speed=" + speed.format("%.1f"));
-                    return;
-                }
+                return pdist.toFloat() / (pdt.toFloat() / 1000.0);
             }
         }
-
-        _recordJump(when, basePa, minPa, peakTs, dip);
+        return -1.0f;
     }
 
     // --- Recording ---------------------------------------------------------
@@ -545,8 +683,7 @@ class JumpDetector {
         var airtimeS = airtimeMs.toFloat() / 1000.0;
 
         // Height from the pressure dip using the ICAO barometric
-        // formula on the median-smoothed peak. h = 44330 * (1 - (P/P0)
-        // ^ 0.190263) metres.
+        // formula. h = 44330 * (1 - (P/P0) ^ 0.190263) metres.
         var heightM = 0;
         if (basePa > 0 && minPa > 0) {
             var ratio = minPa.toDouble() / basePa.toDouble();
@@ -557,25 +694,36 @@ class JumpDetector {
             }
         }
 
-        // Jump length: takeoff position = the last GPS fix at/before
-        // takeoff (+1 s slack for the 1 Hz fix rate); landing position
-        // = the latest fix.
-        var tLat = 0.0f;
-        var tLon = 0.0f;
-        var haveTakeoff = false;
+        // Jump length: the fix nearest takeoff to the fix nearest
+        // landing, each required within POSITION_MATCH_MS of its anchor.
+        //
+        // The previous version ran from "last fix before takeoff + 1 s"
+        // to getLatestPosition(). _recordJump runs PENDING_MS after the
+        // landing impact, so the latest fix is seconds past landing and
+        // every length carried ~3.5 s of riding with it - 35-40 m at
+        // kite speeds, enough to trip the 100 m sanity cap on a real
+        // jump.
         var positions = _aggregator.getRecentPositions(32);
-        for (var pi = 0; pi < positions.size(); pi++) {
-            var p = positions[pi];
-            if (p[:when] <= _pendTakeoffTs + 1000) {
-                tLat = p[:lat];
-                tLon = p[:lon];
-                haveTakeoff = true;
-            }
+        var takeoffFix = _fixNearest(positions, _pendTakeoffTs);
+        var landingFix = _fixNearest(positions, _pendLandingTs);
+
+        // A jump shorter than the GPS fix interval can put both anchors
+        // on the SAME fix, which would report 0 m for a real jump. Fall
+        // back to bracketing it - last fix at or before takeoff, first
+        // at or after landing. That overstates by up to one fix
+        // interval, but it is a measurement rather than a zero.
+        if (takeoffFix != null && landingFix != null
+                && takeoffFix[:when] == landingFix[:when]) {
+            takeoffFix = _fixAtOrBefore(positions, _pendTakeoffTs);
+            landingFix = _fixAtOrAfter(positions, _pendLandingTs);
         }
+
         var lengthM = 0.0f;
-        var lPos = _aggregator.getLatestPosition();
-        if (haveTakeoff && lPos != null) {
-            lengthM = _haversineMeters(tLat, tLon, lPos[:lat], lPos[:lon]);
+        if (takeoffFix != null && landingFix != null
+                && takeoffFix[:when] != landingFix[:when]) {
+            lengthM = _haversineMeters(
+                takeoffFix[:lat], takeoffFix[:lon],
+                landingFix[:lat], landingFix[:lon]);
         }
 
         try {
@@ -627,14 +775,16 @@ class JumpDetector {
     // (chop slap, pop, crash). Short cooldown so a pop does not blind
     // us to the real landing that follows within a second or two.
 
-    function _shortDiscard(when as Number, reason as String) as Void {
+    function _shortDiscard(when as Number, code as Number, reason as String) as Void {
+        _discardCounts[code]++;
         Logger.warn("detector: discard - " + reason);
         _enterCoasting(when, DISCARD_COAST_MS);
     }
 
     // A PENDING candidate that failed the barometric confirmation.
 
-    function _discardCandidate(when as Number, reason as String) as Void {
+    function _discardCandidate(when as Number, code as Number, reason as String) as Void {
+        _discardCounts[code]++;
         Logger.warn("detector: discard candidate - " + reason);
         _enterCoasting(when, DISCARD_COAST_MS);
     }
@@ -646,35 +796,6 @@ class JumpDetector {
     }
 
     // --- Pressure helpers ---------------------------------------------------
-
-    // Median-of-3 causal smoothing over the raw 1 Hz pressure ring.
-    // A single-sample splash spike (water hitting the port) cannot move
-    // the smoothed value; a real multi-second climb can.
-
-    function _smoothedPressureSeries() as Array<Dictionary>? {
-        var raws = _aggregator.getRecentPressure(PRESSURE_LOOKBACK);
-        var n = raws.size();
-        if (n < 3) {
-            return null;
-        }
-        var out = new Array<Dictionary>[n];
-        for (var i = 0; i < n; i++) {
-            var pa;
-            if (i >= 2) {
-                pa = _median3(raws[i - 2][:pa], raws[i - 1][:pa], raws[i][:pa]);
-            } else {
-                pa = raws[i][:pa];
-            }
-            out[i] = { :pa => pa, :when => raws[i][:when] };
-        }
-        return out;
-    }
-
-    function _median3(a as Number, b as Number, c as Number) as Number {
-        if ((a <= b && b <= c) || (c <= b && b <= a)) { return b; }
-        if ((b <= a && a <= c) || (c <= a && a <= b)) { return a; }
-        return c;
-    }
 
     function _medianOf(vals as Array<Number>) as Number {
         var n = vals.size();
@@ -695,6 +816,50 @@ class JumpDetector {
             return arr[n / 2];
         }
         return (arr[n / 2 - 1] + arr[n / 2]) / 2;
+    }
+
+    // The fix closest to `ts`, or null when the nearest is further away
+    // than POSITION_MATCH_MS.
+
+    function _fixNearest(positions as Array<Dictionary>, ts as Number) as Dictionary? {
+        var best = null;
+        var bestGap = POSITION_MATCH_MS + 1;
+        for (var i = 0; i < positions.size(); i++) {
+            var p = positions[i];
+            var gap = p[:when] - ts;
+            if (gap < 0) { gap = -gap; }
+            if (gap < bestGap) {
+                bestGap = gap;
+                best = p;
+            }
+        }
+        return best;
+    }
+
+    // Latest fix at or before `ts`, within POSITION_MATCH_MS.
+
+    function _fixAtOrBefore(positions as Array<Dictionary>, ts as Number) as Dictionary? {
+        var best = null;
+        for (var i = 0; i < positions.size(); i++) {
+            var p = positions[i];
+            if (p[:when] <= ts && ts - p[:when] <= POSITION_MATCH_MS) {
+                if (best == null || p[:when] > best[:when]) { best = p; }
+            }
+        }
+        return best;
+    }
+
+    // Earliest fix at or after `ts`, within POSITION_MATCH_MS.
+
+    function _fixAtOrAfter(positions as Array<Dictionary>, ts as Number) as Dictionary? {
+        var best = null;
+        for (var i = 0; i < positions.size(); i++) {
+            var p = positions[i];
+            if (p[:when] >= ts && p[:when] - ts <= POSITION_MATCH_MS) {
+                if (best == null || p[:when] < best[:when]) { best = p; }
+            }
+        }
+        return best;
     }
 
     // Great-circle distance between two lat/lon points, in metres.

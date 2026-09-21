@@ -93,14 +93,22 @@ code.
 
 ### Simulator hang in this environment
 
-The Connect IQ simulator (`open -a ConnectIQ`) **hangs on launch in
-this development environment**. `monkeyc --unit-test` builds succeed
-with zero warnings, but `monkeydo build/test.prg instinct2 -t`
-cannot be executed because the simulator never reaches a state where
-it can accept the test runner. The simulator hang is a known issue
-with this machine's Connect IQ install and is **not** caused by the
-test source. All post-iteration validation has therefore been
-performed on the real Instinct Solar 2 (see §6).
+The Connect IQ simulator runs the suite on this machine as of SDK
+9.2.0 (2026-09-15); an earlier note here claimed it hung on launch,
+which is no longer true. Launch it once, wait for it to listen, then
+run the tests:
+
+```bash
+open -a "$(ls -d ~/Library/Application\ Support/Garmin/ConnectIQ/Sdks/*/bin | head -1)/ConnectIQ.app"
+./build.sh -t
+monkeydo build/test.prg instinct2 -t
+```
+
+Note that `build.sh` clears `build/` on every invocation, so `-t` must
+be the most recent build before `monkeydo` runs. Device validation on
+the real Instinct Solar 2 (see §6) still matters for anything
+sensor-related, because the simulator cannot reproduce the
+accelerometer stream or the barometer.
 
 ### Known pre-existing test failures
 
@@ -109,8 +117,8 @@ the test suite in the simulator:
 
 - Tests that depend on the simulator's manual accelerometer feed
   (low-rate, single-sample-at-a-time) cannot reproduce the 25 Hz
-  sustained spike the detector expects; they pass when the same
-  sequence is fed through the public API in code.
+  sustained spike the detector expects; the suite therefore drives
+  `JumpDetector.onAccelSample` directly instead.
 - Tests that assert on `SessionReviewView` and `SummaryView` are not
   included; Connect IQ UI is not unit-testable without a display
   surface.

@@ -8,9 +8,9 @@
 // Buffer sizes are tuned for the Instinct Solar 2:
 //
 //   accel    : 100 samples  ≈ 4 s @ 25 Hz (matches accelerometer sample rate)
-//   pressure :  64 samples  ≈ 32 s @ 2 Hz (we poll getPressureHistory every
-//                                       1 s and the device typically returns
-//                                       the last 2 samples per call)
+//   pressure : 160 samples  ≈ 40 s @ 4 Hz (polled from
+//                                       Activity.getActivityInfo(); duplicate
+//                                       consecutive readings are not stored)
 //   gps      :  32 samples  ≈ 32 s @ 1 Hz (continuous GPS, 1 Hz update)
 //
 // Each buffer is implemented as a fixed-capacity ring with a monotonic
@@ -26,7 +26,8 @@ import Toybox.Lang;
 class SensorAggregator {
 
     static const ACCEL_CAPACITY    = 100;
-    static const PRESSURE_CAPACITY = 64;
+    // ~40 s at the 4 Hz pressure poll rate.
+    static const PRESSURE_CAPACITY = 160;
     static const GPS_CAPACITY      = 32;
 
     // --- Accelerometer ring ---
@@ -42,9 +43,14 @@ class SensorAggregator {
     var _pressureCount as Number;
 
     // --- GPS ring ---
-    var _posLat  as Array<Double>;
-    var _posLon  as Array<Double>;
-    var _posWhen as Array<Number>;
+    var _posLat   as Array<Double>;
+    var _posLon   as Array<Double>;
+    var _posWhen  as Array<Number>;
+    // Ground speed as reported by the GPS, or -1.0 when the fix did not
+    // carry one. Differencing two 1 Hz fixes reads 0 m/s whenever
+    // consecutive callbacks repeat a position, so the reported value is
+    // strongly preferred.
+    var _posSpeed as Array<Float>;
     var _posCount as Number;
 
     function initialize() {
@@ -61,6 +67,7 @@ class SensorAggregator {
         _posLat        = new Array<Double>[GPS_CAPACITY];
         _posLon        = new Array<Double>[GPS_CAPACITY];
         _posWhen       = new Array<Number>[GPS_CAPACITY];
+        _posSpeed      = new Array<Float>[GPS_CAPACITY];
         _posCount      = 0;
     }
 
@@ -82,11 +89,13 @@ class SensorAggregator {
         _pressureCount++;
     }
 
-    function pushPosition(lat as Double, lon as Double, when as Number) as Void {
+    function pushPosition(lat as Double, lon as Double, when as Number,
+                          speed as Float) as Void {
         var idx = _posCount % GPS_CAPACITY;
-        _posLat[idx]  = lat;
-        _posLon[idx]  = lon;
-        _posWhen[idx] = when;
+        _posLat[idx]   = lat;
+        _posLon[idx]   = lon;
+        _posWhen[idx]  = when;
+        _posSpeed[idx] = speed;
         _posCount++;
     }
 
@@ -131,9 +140,10 @@ class SensorAggregator {
         if (_posCount == 0) { return null; }
         var idx = (_posCount - 1) % GPS_CAPACITY;
         return {
-            :lat  => _posLat[idx],
-            :lon  => _posLon[idx],
-            :when => _posWhen[idx]
+            :lat   => _posLat[idx],
+            :lon   => _posLon[idx],
+            :when  => _posWhen[idx],
+            :speed => _posSpeed[idx]
         };
     }
 
@@ -146,18 +156,6 @@ class SensorAggregator {
 
     function getRecentAccel(maxSamples as Number) as Array<Dictionary> {
         return _copyAccelWindow(getAccelCount(), maxSamples);
-    }
-
-    function getRecentAccelSince(newestWhen as Number) as Array<Dictionary> {
-        var avail = getAccelCount();
-        var n = 0;
-        // walk backwards from newest, count while within window
-        for (var i = 0; i < avail; i++) {
-            var idx = (_accelCount - 1 - i) % ACCEL_CAPACITY;
-            if (_accelWhen[idx] < newestWhen) { break; }
-            n++;
-        }
-        return _copyAccelWindow(n, n);
     }
 
     function getRecentPressure(maxSamples as Number) as Array<Dictionary> {
@@ -182,9 +180,10 @@ class SensorAggregator {
         for (var i = 0; i < n; i++) {
             var idx = (start + i) % GPS_CAPACITY;
             out[i] = {
-                :lat  => _posLat[idx],
-                :lon  => _posLon[idx],
-                :when => _posWhen[idx]
+                :lat   => _posLat[idx],
+                :lon   => _posLon[idx],
+                :when  => _posWhen[idx],
+                :speed => _posSpeed[idx]
             };
         }
         return out;

@@ -74,16 +74,6 @@ class SessionReviewView extends WatchUi.View {
         WatchUi.requestUpdate();
     }
 
-    // Translate a JumpDetector landing-path code back to a
-    // human-readable string for on-screen display. Must stay in
-    // lock-step with JumpDetector: 0="impact" (the landing-first
-    // redesign has a single detection path), anything else =
-    // "unknown".
-    function _codeToLandingPath(code as Number) as String {
-        if (code == 0) { return "impact"; }
-        return "unknown";
-    }
-
     function onUpdate(dc as Graphics.Dc) as Void {
         dc.setColor(Graphics.COLOR_BLACK, Graphics.COLOR_BLACK);
         dc.clear();

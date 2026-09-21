@@ -42,6 +42,10 @@ class SessionManager {
     var _lengthField  as FitContributor.Field?;
     var _airtimeField as FitContributor.Field?;
     var _jumpCount    as Number;
+    // Jumps the recorder itself refused (corrupt height). Reported on
+    // the session-end DISCARD_TALLY line so a detector rejection and a
+    // recorder rejection are distinguishable without a per-jump log.
+    var _skippedSanity    as Number;
 
     function initialize() {
         _state        = STATE_IDLE;
@@ -50,6 +54,7 @@ class SessionManager {
         _lengthField  = null;
         _airtimeField = null;
         _jumpCount    = 0;
+        _skippedSanity    = 0;
     }
 
     function getState() as Number {
@@ -71,6 +76,10 @@ class SessionManager {
 
     function getJumpCount() as Number {
         return _jumpCount;
+    }
+
+    function getSkippedSanity() as Number {
+        return _skippedSanity;
     }
 
     // ------------------------------------------------------------------
@@ -238,40 +247,41 @@ class SessionManager {
 
         var baroH  = heightM.toFloat();
 
-        // Upper-bound sanity discard. A barometric height above 20 m
-        // or a takeoff-to-landing distance above 100 m cannot be a
-        // realistic kiteboarding jump on the wrist-mounted sensor.
-        // Such values usually mean the median-filtered _minPressure
-        // path (or a future path) produced a corrupt altitude, or the
-        // rider covered a long stretch of water without an actual
-        // jump. Drop the row instead of polluting the FIT file.
-        if (baroH > 20.0 || lengthM.toFloat() > 100.0) {
-            Logger.info("session: jump skipped sanity (baro=" + baroH.format("%.1f")
-                + "m length=" + lengthM.toFloat().format("%.1f") + "m)");
+        // Height sanity. Above 20 m is not a kiteboarding jump on a
+        // wrist sensor; it means the pressure series was corrupt. Drop
+        // the row rather than pollute the FIT file.
+        if (baroH > 20.0) {
+            _skippedSanity++;
+            Logger.info("session: jump skipped sanity (baro=" + baroH.format("%.1f") + "m)");
             return false;
         }
 
-        // Two-part filter. The barometric check rejects jumps whose
-        // peak altitude never reaches 1.2 m above the takeoff baseline
-        // (the detector's BARO_DIP_PA = 18 Pa gate corresponds to
-        // ~1.5 m, so this is mostly a redundant safety net — kept as
-        // defence in depth). The airtime check matches the detector's
-        // MIN_FLIGHT_MS = 800 ms gate.
-        var airtimeS = duration.toFloat() / 1000.0;
-        if (baroH <= 1.2 || airtimeS <= 0.75) {
-            Logger.info("session: jump skipped (baro=" + baroH.format("%.1f") + "m airtime=" + airtimeS.format("%.2f") + "s)");
-            return false;
+        // Length sanity. An implausible length means GPS anchoring
+        // failed, not that the jump was fake - the height and airtime
+        // are still good - so clamp the field instead of dropping the
+        // whole lap. Discarding here used to be invisible: the jump
+        // stayed in the session list with :recorded = false and simply
+        // vanished from the review screen.
+        var lengthOut = lengthM.toFloat();
+        if (lengthOut > 100.0) {
+            Logger.info("session: length clamped (" + lengthOut.format("%.1f") + "m)");
+            lengthOut = 0.0;
         }
+
+        // Lower gates live in JumpDetector (BARO_DIP_PA, MIN_FLIGHT_MS).
+        // Duplicating them here let the two drift apart, so only the
+        // sanity caps above remain.
+        var airtimeS = duration.toFloat() / 1000.0;
         Logger.info(
             "SessionManager.addJumpLap: values"
             + " heightM=" + baroH.format("%.1f")
-            + " lengthM=" + lengthM.toFloat().format("%.1f")
+            + " lengthM=" + lengthOut.format("%.1f")
             + " airtimeS=" + airtimeS.format("%.2f")
         );
 
         Logger.info("SessionManager.addJumpLap: before setData (all fields)");
         _heightField.setData(baroH);
-        _lengthField.setData(lengthM.toFloat());
+        _lengthField.setData(lengthOut);
         _airtimeField.setData(airtimeS);
         Logger.info("SessionManager.addJumpLap: after setData");
 
@@ -283,7 +293,7 @@ class SessionManager {
             Logger.info(
                 "session: lap added (count=" + _jumpCount
                 + " heightM=" + baroH.format("%.1f")
-                + " lengthM=" + lengthM.toFloat().format("%.1f")
+                + " lengthM=" + lengthOut.format("%.1f")
                 + " airtimeS=" + airtimeS.format("%.2f") + ")"
             );
         } else {
