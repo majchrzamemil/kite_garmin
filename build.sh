@@ -28,7 +28,10 @@ SCRIPT_DIR="$( cd "$( dirname "${BASH_SOURCE[0]}" )" && pwd )"
 cd "$SCRIPT_DIR"
 
 DEV_KEY="${HOME}/.Garmin/connect_iq_dev_key.der"
-DEVICE="instinct2"
+# The watch this project is field-tested on is an Instinct 2X Solar
+# (see Debug/ERR_LOG.BAK on the device), so sideloads target instinct2x.
+# The manifest still lists the whole Instinct 2 family for the store.
+DEVICE="instinct2x"
 PACKAGE_MODE=false
 TEST_MODE=false
 DEV_MODE=false

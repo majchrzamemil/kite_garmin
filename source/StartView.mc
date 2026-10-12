@@ -11,9 +11,12 @@ import Toybox.WatchUi;
 
 class StartView extends WatchUi.View {
 
-    function initialize() {
+    var _app as App;
+
+    function initialize(app as App) {
         Logger.info("StartView.initialize: entered");
         View.initialize();
+        _app = app;
         Logger.info("StartView.initialize: done");
     }
 
@@ -37,5 +40,17 @@ class StartView extends WatchUi.View {
 
         y += lineH;
         dc.drawText(cx, y, Graphics.FONT_SMALL, "to begin session", Graphics.TEXT_JUSTIFY_CENTER);
+
+        // Stored session summary (a BACK-exit could not show the
+        // review at stop time) with its UP/DOWN shortcut.
+        if (_app != null && _app.hasLastSession()) {
+            var last = _app.getLastSessionLine();
+            if (last != null) {
+                y = dc.getHeight() - lineH * 2;
+                dc.drawText(cx, y, Graphics.FONT_SMALL, last, Graphics.TEXT_JUSTIFY_CENTER);
+                y += lineH;
+                dc.drawText(cx, y, Graphics.FONT_TINY, "UP/DOWN to review", Graphics.TEXT_JUSTIFY_CENTER);
+            }
+        }
     }
 }

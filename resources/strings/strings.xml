@@ -11,6 +11,10 @@
   <string id="JumpHeightLabel">Jump Height</string>
   <string id="JumpLengthLabel">Jump Length</string>
   <string id="JumpAirtimeLabel">Airtime</string>
+  <string id="RawPressureLabel">Raw Pressure</string>
+  <string id="AccelGLabel">Accel G</string>
   <string id="MetersUnit">m</string>
   <string id="SecondsUnit">s</string>
+  <string id="PascalUnit">Pa</string>
+  <string id="GUnit">G</string>
 </strings>

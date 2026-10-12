@@ -1,8 +1,8 @@
 # Kite Tracker
 
-Garmin Connect IQ watch app for the **Instinct Solar 2** that records
+Garmin Connect IQ watch app for the **Instinct 2 family** that records
 kite jumps from the on-wrist accelerometer, barometer, and GPS.
-**Validated end-to-end on a real Instinct Solar 2.**
+**Validated end-to-end on a real Instinct 2X Solar.**
 
 ## What it does
 
@@ -30,8 +30,11 @@ kite jumps from the on-wrist accelerometer, barometer, and GPS.
   two cannot drift apart.
 - Press **START** to end the session. The `SessionReviewView` lists
   every recorded jump one per screen; UP/DOWN scrolls the list,
-  BACK exits. The FIT activity syncs to Garmin Connect and each jump
-  appears as a lap with the custom lap fields declared in
+  BACK exits. Exiting the app mid-session (BACK) also saves the
+  activity: the summary is persisted to app storage and the start
+  screen offers `UP/DOWN to review` on the next launch. The FIT
+  activity syncs to Garmin Connect and each jump appears as a lap with
+  the custom lap fields declared in
   `resources/fitcontributions/fitcontributions.xml`.
 
 ## How it works
@@ -104,7 +107,20 @@ cleanest wrist signal in kiteboarding, so it is the trigger.
    (pressure steps down through a turn and *stays* down). The
    taking the second-lowest flight sample kills single-sample splash spikes of any
    size — the old `SPLASH_OUTLIER_PA` constant is gone.
-6. **No watchdog.** There is no persistent AIRBORNE state to get
+6. **Field-validated gates (2026-10).** After the takeoff refinement
+   anchors the window to the pressure dip's start — so height,
+   airtime, and GPS length describe the same interval — the
+   candidate must also survive: an airtime ceiling
+   (`MAX_AIRTIME_MS`), a flat pre-takeoff baseline
+   (`BASELINE_MAX_SPREAD_PA`), a sustained dip (≥ 2 samples within
+   `DIP_SUSTAIN_BAND_PA`), a climbable dip rate
+   (`BARO_MAX_DIP_RATE_PA_S`), and a kinematic height/airtime check
+   (`ABSURD_VEL_MPS`). Candidate windows are also clamped past the
+   previous event's validation windows, which is what stops
+   back-to-back detections from inflating each other during crash
+   sequences. Each rejection is tallied in the session-end
+   `DISCARD_TALLY` log line.
+7. **No watchdog.** There is no persistent AIRBORNE state to get
    stuck: a candidate that fails any gate is discarded, never
    force-landed into the FIT file. The GPS-speed landing path is
    gone too — real kite jumps land at riding speed (5–8 m/s), so
@@ -194,10 +210,15 @@ estimate too noisy on real data.
 | `EXCURSION_RUN_MAX` | 5 | An excursion run longer than this = riding; window stops. |
 | `MAX_WINDOW_EXCURSIONS` | 8 | Cumulative excursions in the window; chop hits this within ~2 s. |
 | `MIN_FLIGHT_MS` | **800** | Shorter quiet window = chop slap, not a jump. |
-| `MAX_FLIGHT_MS` | **8000** | Backward scan cap (also the airtime ceiling). |
+| `MAX_FLIGHT_MS` | **8000** | Backward scan cap. |
+| `MAX_AIRTIME_MS` | **4500** | Recorded airtime ceiling; longer windows swallowed riding. |
 | `FREEFALL_SOFT_G` | **0.90** | ≥ 1 sample below this in flight = weightlessness evidence. |
 | `BARO_DIP_PA` | **18** | Required dip below baseline during flight (~1.5 m). |
 | `BARO_RETURN_PA` | **30** | Post-landing sample must return this close to baseline. |
+| `BASELINE_MAX_SPREAD_PA` | **40** | Baseline window wander above this = not a baseline. |
+| `DIP_SUSTAIN_BAND_PA` | **20** | Dip needs ≥ 2 flight samples within this band (transient killer). |
+| `BARO_MAX_DIP_RATE_PA_S` | **200** | Pa/s ceiling on the dip; faster = splash/port transient. |
+| `ABSURD_VEL_MPS` | **25** | Implied mean vertical speed above this is kinematically impossible. |
 | `BASELINE_BACK_MS` | 4000 | Baseline median window starts this far before takeoff. |
 | `BASELINE_GAP_MS` | 500 | Baseline median window ends this far before takeoff. |
 | `PENDING_MS` | **2600** | Post-landing wait for at least two fresh baro samples. |
@@ -215,18 +236,16 @@ reduced-G sample, and the barometric dip-and-return shape).
 
 ```bash
 cd /Users/em/Documents/repos/kite_garmin
-./build.sh
+./build.sh              # device .prg for sideloading (instinct2x)
+./build.sh --dev        # dev-id sideload variant (own app id + logs)
+./build.sh -e           # store package: build/app.iq, all manifest devices
+./build.sh -t           # unit-test binary: build/test.prg
 ```
 
-`build.sh` invokes `monkeyc -y ~/.Garmin/connect_iq_dev_key.der
--o build/app.prg -d instinct2 -f monkey.jungle` and writes
-`build/app.prg`. Equivalent one-liner:
-
-```bash
-monkeyc -o build/app.prg -d instinct2 -f monkey.jungle
-```
-
-Expected output: `BUILD SUCCESSFUL`. See
+`build.sh` injects the signing key from
+`~/.Garmin/connect_iq_dev_key.der` and defaults the sideload target to
+`instinct2x` (the field-test watch; the manifest covers the whole
+Instinct 2 family, and `-e` packages all of it). See
 [`docs/SIDELOAD.md`](docs/SIDELOAD.md) for installing on the watch.
 
 For the unit-test build add `--unit-test`:
@@ -269,9 +288,12 @@ The project pre-creates both `APP.TXT` and a lowercase `app.TXT`
 fallback when side-loading; whichever the watch writes to is the
 file to pull. Lines prefixed with `[KITE]` come from `Logger.mc`.
 Verbose logs from `SessionReviewView` are intentionally stripped so
-the detection lines (`JUMP CANDIDATE`, `detector: discard ...`,
-`JUMP LANDED`, `SESSION_DUMP_*`) stay readable when scrolling
-through a 20-jump session.
+the detection lines (`JUMP CANDIDATE`, `CAND baro`, `detector:
+discard ...`, `JUMP LANDED`, `SESSION_DUMP_*`, `DISCARD_TALLY`,
+`ACCEL_STATS`, `BARO_STATS`) stay readable when scrolling through a
+20-jump session. The FIT also carries per-record `raw_pressure` and
+`accel_g` developer fields, so any recorded jump can be replayed
+offline even after the text log has rotated.
 
 ## Testing
 
@@ -279,34 +301,25 @@ Unit tests live in `source/test/`. Each `(:test)`-annotated function
 is compiled only by the `--unit-test` build:
 
 ```bash
-monkeyc -y ~/.Garmin/connect_iq_dev_key.der \
-         -o build/test.prg \
-         -d instinct2 \
-         -f monkey.jungle \
-         --unit-test
+./build.sh -t
 open -a ConnectIQ
-monkeydo build/test.prg instinct2 -t
+monkeydo build/test.prg instinct2x -t
 ```
 
-The full suite covers `SensorAggregator` ring-buffer behaviour and
-the `JumpDetector` state machine, including the multi-jump regression
-tests added after the real-watch crash on the second jump of a
-session. See [`docs/TESTING.md`](docs/TESTING.md) for the simulator
-caveats and the real-watch testing workflow.
-
-> The Connect IQ simulator hangs on launch in this development
-> environment; `--unit-test` builds succeed but `monkeydo -t` cannot
-> be executed here. See `docs/TESTING.md` for the simulator caveats
-> and known pre-existing test failures.
+The full suite (28 tests) covers `SensorAggregator` ring-buffer
+behaviour and the `JumpDetector` state machine, including replays of
+real false-positive sessions (wet port, tack drift, crash bursts) and
+the 2026-10 gate regressions. See [`docs/TESTING.md`](docs/TESTING.md)
+for the simulator workflow and the real-watch testing loop.
 
 ## Device support
 
 | Field | Value |
 |-------|-------|
-| Target device | Garmin Instinct Solar 2 |
-| Connect IQ product id | `instinct2` |
+| Target devices | Garmin Instinct 2 family (`instinct2`, `instinct2s`, `instinct2x`, `instinctcrossover`) |
+| Field-tested on | Instinct 2X Solar, fw 17.11 |
 | Min API level | 3.0.0 |
-| Manifest | `manifest.xml` (single product) |
+| Manifest | `manifest.xml` (store id); `manifest-dev.xml` (side-load dev id) |
 | Build key | `~/.Garmin/connect_iq_dev_key.der` |
 
 ## Project layout
@@ -344,10 +357,10 @@ docs/
 
 | View | When it appears | What it shows |
 |------|-----------------|---------------|
-| **StartView** | App launch | "Press START to begin" |
+| **StartView** | App launch | "Press START to begin", plus "Last: N jumps · Xs air" with an UP/DOWN review shortcut when a stored session exists |
 | **SessionView** | During recording | Recording status and jump count (`Jumps: N`) |
 | **SummaryView** | Immediately after a recorded jump | Large centred height (e.g. `4.2m`) plus time and travel on the line below |
-| **SessionReviewView** | After ending the session | Scrollable list of recorded jumps (UP/DOWN). Each screen shows height, length, and airtime |
+| **SessionReviewView** | After ending the session (or via UP/DOWN from the start screen after a BACK-exit) | Scrollable list of recorded jumps (UP/DOWN). Each screen shows height, length, and airtime |
 
 Example SummaryView layout on the 176×176 Instinct Solar 2 screen:
 
@@ -375,11 +388,9 @@ Screenshot assets: `assets/screenshots/`
   data to the FIT file (download with FITCSVTool to inspect it) but
   Connect won't render the columns because the rendering metadata
   lives in the app-store JSON, not in the `.prg`.
-- **Short jumps may fail the baro dip gate.** The barometer's true
-  update rate is unmeasured; we poll at 4 Hz and store only changed
-  readings. If the sensor really updates at 1 Hz, a fast jump (apex
-  under a second) can leave fewer than two distinct flight samples,
-  and the second-lowest-sample splash guard then refuses to confirm
-  the dip. The `noDip` entry in the session-end `DISCARD_TALLY` line
-  counts these; a high value on a jump-heavy session means the
-  barometer needs a faster path.
+- **Short jumps are out of scope.** A sub-1 s hop means an apex under
+  ~1.2 m and a barometric dip of ~12–15 Pa, which is below the
+  riding-noise floor; at the barometer's ~1 Hz update rate the flight
+  window often holds a single sample. The sustained-dip gate rejects
+  those by design — deliberate, documented, and counted in the
+  session-end `DISCARD_TALLY` line.

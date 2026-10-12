@@ -51,6 +51,14 @@
 //   7. RECORD    - height from the ICAO formula on the second-lowest
 //                  flight sample.
 //
+// Additional gates from the 2026-10-10 false-jump field data
+// (docs/JUMP_DETECTION_ANALYSIS.md): the takeoff refinement runs BEFORE
+// the dip search so height/airtime/length share one window; the
+// baseline window is clamped past the previous candidate's validation
+// windows and must be flat; the dip must be sustained (>= 2 samples)
+// and its rate must be climbable; and the height/airtime pair must not
+// imply an impossible vertical speed.
+//
 // There is no AIRBORNE watchdog any more: a candidate that fails any
 // gate is discarded (short cooldown), never force-landed into the FIT
 // file. The GPS-speed landing path is gone too — real kite jumps land
@@ -101,6 +109,11 @@ class JumpDetector {
     static const MIN_FLIGHT_MS         = 800;
     static const MAX_FLIGHT_MS         = 8000;
 
+    // Recorded airtime ceiling. Above this the window has absorbed
+    // riding (dip anchored seconds before the pop), not flight: the
+    // 2026-10-11 session recorded 6.9-7.4 s "airtimes" at 2 m heights.
+    static const MAX_AIRTIME_MS        = 4500;
+
     // At least one sample below this inside the flight = weightlessness
     // evidence (kite-line tension keeps G near 1, but the apex of even
     // a small jump dips below 0.9 G for a few samples at 25 Hz).
@@ -121,6 +134,26 @@ class JumpDetector {
     static const BARO_RETURN_PA        = 30;
     static const BASELINE_BACK_MS      = 4000;
     static const BASELINE_GAP_MS       = 500;
+
+    // A baseline window wider than this is not a baseline: the pressure
+    // was already moving (ram-air drift, or the previous event's
+    // excursion). Measured quiet-riding wander is well under this.
+    static const BASELINE_MAX_SPREAD_PA = 40;
+
+    // The dip must be sustained: at least two flight-window samples
+    // within this band of the dip value. A one-sample excursion is a
+    // splash/transient, not altitude (see docs/JUMP_DETECTION_ANALYSIS.md).
+    static const DIP_SUSTAIN_BAND_PA   = 20;
+
+    // Pressure cannot fall faster than a rider can climb. dip / airtime
+    // above this is a transient (the 2026-10-10 14.9 m false event
+    // implied ~225 Pa/s; real jumps stay under ~100).
+    static const BARO_MAX_DIP_RATE_PA_S = 200;
+
+    // Mean vertical speed implied by height/airtime above this is
+    // kinematically impossible for a kite jump (2026-10-10: 14.9 m
+    // in 0.80 s -> 37 m/s).
+    static const ABSURD_VEL_MPS        = 25.0;
 
     // Long enough for at least two post-landing pressure samples at the
     // 1 Hz worst case, so the return check below has something real to
@@ -172,7 +205,12 @@ class JumpDetector {
     static const DISCARD_NO_DIP          = 7;
     static const DISCARD_NO_RETURN       = 8;
     static const DISCARD_SLOW_TAKEOFF    = 9;
-    static const DISCARD_REASON_COUNT    = 10;
+    static const DISCARD_UNSTABLE_BASELINE = 10;
+    static const DISCARD_NO_SUSTAIN      = 11;
+    static const DISCARD_FAST_DIP        = 12;
+    static const DISCARD_ABSURD_KINEMATICS = 13;
+    static const DISCARD_LONG_FLIGHT     = 14;
+    static const DISCARD_REASON_COUNT    = 15;
 
     var _aggregator       as SensorAggregator;
     var _state            as Number;
@@ -188,6 +226,14 @@ class JumpDetector {
     var _pendLandingTs    as Number;
     var _pendAirtimeMs    as Number;
 
+    // Previous-event boundary (F3 in docs/JUMP_DETECTION_ANALYSIS.md):
+    // pressure samples before this belong to the previous candidate's
+    // validation windows and must not become this one's baseline/dip.
+    // Clean = previous candidate was recorded (its return was verified
+    // within BARO_RETURN_PA), so its post-landing samples are usable.
+    var _lastEventLandingTs as Number;
+    var _lastEventClean      as Boolean;
+
     var _discardCounts    as Array<Number>;
 
     function initialize(aggregator as SensorAggregator) {
@@ -202,6 +248,8 @@ class JumpDetector {
         _pendTakeoffTs    = 0;
         _pendLandingTs    = 0;
         _pendAirtimeMs    = 0;
+        _lastEventLandingTs = 0;
+        _lastEventClean     = true;
         _discardCounts    = new Array<Number>[DISCARD_REASON_COUNT];
         for (var i = 0; i < DISCARD_REASON_COUNT; i++) { _discardCounts[i] = 0; }
     }
@@ -219,6 +267,8 @@ class JumpDetector {
         _pendTakeoffTs = 0;
         _pendLandingTs = 0;
         _pendAirtimeMs = 0;
+        _lastEventLandingTs = 0;
+        _lastEventClean     = true;
         for (var i = 0; i < DISCARD_REASON_COUNT; i++) { _discardCounts[i] = 0; }
     }
 
@@ -472,6 +522,17 @@ class JumpDetector {
             return;
         }
 
+        // Pressure samples before this belong to the previous candidate's
+        // validation windows; using them as this candidate's baseline or
+        // dip is how back-to-back detections inflate each other (the
+        // 2026-10-10 bursts). Clean = previous event was recorded, so its
+        // post-landing pressure was verified back within BARO_RETURN_PA.
+        var eventFloorTs = _lastEventLandingTs;
+        if (!_lastEventClean) {
+            eventFloorTs = eventFloorTs + PENDING_MS;
+        }
+        var origTakeoffTs = _pendTakeoffTs;
+
         // Baseline: median of the raw samples in the pre-takeoff window
         // [takeoff - BASELINE_BACK_MS, takeoff - BASELINE_GAP_MS]. The
         // median is already outlier-proof, so no pre-smoothing needed.
@@ -479,12 +540,27 @@ class JumpDetector {
         var baseVals = [] as Array<Number>;
         for (var si = 0; si < raws.size(); si++) {
             var r = raws[si];
-            if (r[:when] >= _pendTakeoffTs - BASELINE_BACK_MS
-                    && r[:when] <= _pendTakeoffTs - BASELINE_GAP_MS) {
+            var lo = origTakeoffTs - BASELINE_BACK_MS;
+            if (eventFloorTs > lo) { lo = eventFloorTs; }
+            if (r[:when] >= lo && r[:when] <= origTakeoffTs - BASELINE_GAP_MS) {
                 baseVals.add(r[:pa]);
             }
         }
         if (baseVals.size() > 0) {
+            // Baseline flatness: a window whose samples wander more than
+            // BASELINE_MAX_SPREAD_PA was not at rest, so "dip below
+            // baseline" is meaningless against it.
+            var bMin = baseVals[0];
+            var bMax = baseVals[0];
+            for (var bi = 1; bi < baseVals.size(); bi++) {
+                if (baseVals[bi] < bMin) { bMin = baseVals[bi]; }
+                if (baseVals[bi] > bMax) { bMax = baseVals[bi]; }
+            }
+            if (bMax - bMin > BASELINE_MAX_SPREAD_PA) {
+                _discardCandidate(when, DISCARD_UNSTABLE_BASELINE,
+                    "unstableBaseline spread=" + (bMax - bMin));
+                return;
+            }
             basePa = _medianOf(baseVals);
         } else {
             // Fallback: median of the last few samples at or before
@@ -493,7 +569,7 @@ class JumpDetector {
             var tail = [] as Array<Number>;
             for (var si = 0; si < raws.size(); si++) {
                 var r = raws[si];
-                if (r[:when] <= _pendTakeoffTs) {
+                if (r[:when] <= origTakeoffTs && r[:when] >= eventFloorTs) {
                     tail.add(r[:pa]);
                     if (tail.size() > 3) { tail = tail.slice(1, null); }
                 }
@@ -505,9 +581,50 @@ class JumpDetector {
             basePa = _medianOf(tail);
         }
 
-        // Flight window: the two lowest raw samples strictly after
-        // takeoff and up to the landing impact. minPa is the SECOND
-        // lowest when the window holds more than one sample, so a
+        // Takeoff refinement runs BEFORE the dip search so that height,
+        // airtime and GPS length all describe the same interval. The
+        // accelerometer-only window can extend back through calm riding
+        // (the 2026-09-11 session showed 8 s "airtimes" for ~2 s jumps);
+        // the baseline above stays computed from the pre-refinement
+        // takeoff, which samples the pre-jump riding level.
+        var dipStartTs = origTakeoffTs;
+        for (var si = 0; si < raws.size(); si++) {
+            var r = raws[si];
+            if (r[:when] > origTakeoffTs && r[:when] <= _pendLandingTs
+                    && r[:pa] <= basePa - DIP_START_PA) {
+                dipStartTs = r[:when];
+                break;
+            }
+        }
+        var capTs = _pendLandingTs - MIN_FLIGHT_MS;
+        if (dipStartTs > capTs) {
+            dipStartTs = capTs;
+        }
+        var effStartTs = dipStartTs;
+        if (eventFloorTs > effStartTs) {
+            effStartTs = eventFloorTs;
+        }
+        if (effStartTs > _pendTakeoffTs) {
+            Logger.info("detector: takeoff refined "
+                + (_pendLandingTs - _pendTakeoffTs) + "ms -> "
+                + (_pendLandingTs - effStartTs) + "ms");
+            _pendTakeoffTs = effStartTs;
+            _pendAirtimeMs = _pendLandingTs - effStartTs;
+        }
+
+        // Airtime ceiling: a window this long has swallowed riding on
+        // both sides of the actual flight. The rider does not jump for
+        // five seconds, and the length/airtime pair that survives such
+        // a window is fiction regardless of how clean the dip looks.
+        if (_pendAirtimeMs > MAX_AIRTIME_MS) {
+            _discardCandidate(when, DISCARD_LONG_FLIGHT,
+                "longFlight ms=" + _pendAirtimeMs);
+            return;
+        }
+
+        // Flight window: the two lowest raw samples strictly after the
+        // (refined) takeoff and up to the landing impact. minPa is the
+        // SECOND lowest when the window holds more than one sample, so a
         // single splash outlier cannot set the height.
         var lowest = -1;
         var second = -1;
@@ -543,9 +660,49 @@ class JumpDetector {
         }
 
         var dip = basePa - minPa;
+        var airtimeS = _pendAirtimeMs.toFloat() / 1000.0;
+        if (airtimeS < 0.1) { airtimeS = 0.1; }
+
+        // Per-candidate baro diagnostics: one line, values the rotated
+        // APP log otherwise loses (docs/JUMP_DETECTION_ANALYSIS.md F1).
+        Logger.info("CAND baro base=" + basePa
+            + " nFl=" + flightCount
+            + " dip=" + dip
+            + " rate=" + (dip.toFloat() / airtimeS).format("%.0f")
+            + " airMs=" + _pendAirtimeMs);
+
         if (dip < BARO_DIP_PA) {
             _discardCandidate(when, DISCARD_NO_DIP,
                 "noDip dip=" + dip + " n=" + flightCount);
+            return;
+        }
+
+        // Sustained dip: at least two samples in the flight scan window
+        // within DIP_SUSTAIN_BAND_PA of the dip. A pressure transient
+        // (splash, partial port dunk) shows up as one deep sample
+        // surrounded by baseline; real altitude does not.
+        var sustained = 0;
+        var scanLo = origTakeoffTs;
+        if (eventFloorTs > scanLo) { scanLo = eventFloorTs; }
+        for (var si = 0; si < raws.size(); si++) {
+            var r = raws[si];
+            if (r[:when] > scanLo && r[:when] <= _pendLandingTs
+                    && r[:pa] <= minPa + DIP_SUSTAIN_BAND_PA) {
+                sustained++;
+            }
+        }
+        if (sustained < 2) {
+            _discardCandidate(when, DISCARD_NO_SUSTAIN,
+                "noSustained n=" + sustained);
+            return;
+        }
+
+        // Dip rate: pressure cannot fall faster than the rider can
+        // climb. The 2026-10-10 14.9 m false event implied ~225 Pa/s.
+        var dipRate = dip.toFloat() / airtimeS;
+        if (dipRate > BARO_MAX_DIP_RATE_PA_S) {
+            _discardCandidate(when, DISCARD_FAST_DIP,
+                "fastDip rate=" + dipRate.format("%.0f"));
             return;
         }
 
@@ -584,33 +741,6 @@ class JumpDetector {
             return;
         }
 
-        // Takeoff refinement: anchor the takeoff to where the pressure
-        // actually left the baseline. The accelerometer-only window can
-        // extend back through calm flat-water riding before the pop
-        // (the 2026-09-11 session showed 8 s "airtimes" for ~2 s jumps).
-        // The baseline stays computed from the pre-refinement takeoff,
-        // which is what we want: it samples the pre-jump riding level.
-        var dipStartTs = _pendTakeoffTs;
-        for (var si = 0; si < raws.size(); si++) {
-            var r = raws[si];
-            if (r[:when] > _pendTakeoffTs && r[:when] <= _pendLandingTs
-                    && r[:pa] <= basePa - DIP_START_PA) {
-                dipStartTs = r[:when];
-                break;
-            }
-        }
-        var capTs = _pendLandingTs - MIN_FLIGHT_MS;
-        if (dipStartTs > capTs) {
-            dipStartTs = capTs;
-        }
-        if (dipStartTs > _pendTakeoffTs) {
-            Logger.info("detector: takeoff refined "
-                + (_pendLandingTs - _pendTakeoffTs) + "ms -> "
-                + (_pendLandingTs - dipStartTs) + "ms");
-            _pendTakeoffTs = dipStartTs;
-            _pendAirtimeMs = _pendLandingTs - dipStartTs;
-        }
-
         // GPS speed gate: real jumps only happen from riding speed. A
         // stationary rider (wading out, body-dragging, water-start
         // attempts) produces kite-yank spikes and port-dunk dips that
@@ -621,6 +751,16 @@ class JumpDetector {
         if (takeoffSpeed >= 0.0 && takeoffSpeed < TAKEOFF_SPEED_MPS) {
             _discardCandidate(when, DISCARD_SLOW_TAKEOFF,
                 "slowAtTakeoff speed=" + takeoffSpeed.format("%.1f"));
+            return;
+        }
+
+        // Kinematic absurdity: the height/airtime pair must not imply
+        // an impossible mean vertical speed. Only meaningful because
+        // the dip search now runs over the refined window.
+        var heightM = _baroHeightM(basePa, minPa);
+        if (heightM > 0.0 && (2.0 * heightM / airtimeS) > ABSURD_VEL_MPS) {
+            _discardCandidate(when, DISCARD_ABSURD_KINEMATICS,
+                "absurd h=" + heightM.format("%.1f") + " airS=" + airtimeS.format("%.2f"));
             return;
         }
 
@@ -684,15 +824,7 @@ class JumpDetector {
 
         // Height from the pressure dip using the ICAO barometric
         // formula. h = 44330 * (1 - (P/P0) ^ 0.190263) metres.
-        var heightM = 0;
-        if (basePa > 0 && minPa > 0) {
-            var ratio = minPa.toDouble() / basePa.toDouble();
-            if (ratio < 0.0) { ratio = 0.0; }
-            if (ratio >= 1.0) { ratio = 0.999999; }
-            if (ratio > 0.0) {
-                heightM = (44330.0 * (1.0 - Math.pow(ratio, 0.190263))).toFloat();
-            }
-        }
+        var heightM = _baroHeightM(basePa, minPa);
 
         // Jump length: the fix nearest takeoff to the fix nearest
         // landing, each required within POSITION_MATCH_MS of its anchor.
@@ -767,9 +899,12 @@ class JumpDetector {
         }
 
         _enterCoasting(when, COAST_MS);
-    }
 
-    // --- Discards ----------------------------------------------------------
+        // Return was verified within BARO_RETURN_PA, so post-landing
+        // samples are usable by the next candidate's baseline.
+        _lastEventLandingTs = _pendLandingTs;
+        _lastEventClean = true;
+    }
 
     // A landing-spike trigger with no valid airborne window behind it
     // (chop slap, pop, crash). Short cooldown so a pop does not blind
@@ -786,6 +921,10 @@ class JumpDetector {
     function _discardCandidate(when as Number, code as Number, reason as String) as Void {
         _discardCounts[code]++;
         Logger.warn("detector: discard candidate - " + reason);
+        // The candidate's post-landing pressure was never verified, so
+        // the next candidate treats its whole PENDING window as dirty.
+        _lastEventLandingTs = _pendLandingTs;
+        _lastEventClean = false;
         _enterCoasting(when, DISCARD_COAST_MS);
     }
 
@@ -796,6 +935,21 @@ class JumpDetector {
     }
 
     // --- Pressure helpers ---------------------------------------------------
+
+    // ICAO barometric height for a pressure dip: h = 44330 * (1 - (P/P0)
+    // ^ 0.190263) metres. Returns 0 for unusable inputs.
+
+    function _baroHeightM(basePa as Number, minPa as Number) as Float {
+        if (basePa > 0 && minPa > 0) {
+            var ratio = minPa.toDouble() / basePa.toDouble();
+            if (ratio < 0.0) { ratio = 0.0; }
+            if (ratio >= 1.0) { ratio = 0.999999; }
+            if (ratio > 0.0) {
+                return (44330.0 * (1.0 - Math.pow(ratio, 0.190263))).toFloat();
+            }
+        }
+        return 0.0f;
+    }
 
     function _medianOf(vals as Array<Number>) as Number {
         var n = vals.size();

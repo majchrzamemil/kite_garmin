@@ -265,23 +265,21 @@ diskutil eject /Volumes/GARMIN
 
 ### What to look for in `APP.TXT`
 
-- `JUMP AIRBORNE ts=… takeoffG=… baselinePa=…` — takeoff event with
-  the trigger G and pre-jump pressure.
-- `detector: landing path=pressure|gps|lowG|timeout` — which path
-  closed the jump.
-- `JUMP LANDED ts=… durationMs=… heightM=… airtimeS=…
-  landingPath=… landingPathCode=… freefallConfirmed=…` — full jump
-  metrics.
-- `session: jump skipped (baro=…m airtime=…s)` — landed jump that
-  failed the `SessionManager.addJumpLap` 1.5 m / 1 s record gate.
-- `SESSION_DUMP_START … SESSION_DUMP_END …` — per-session block,
-  one `JUMP_DUMP idx=… heightM=… landingPath=… recorded=…` line
-  per jump (recorded only).
-- `detector: discard no pressure drop …` / `detector: timeout
-  discard no pressure drop …` — candidates rejected by the 20 Pa
-  hybrid filter gate. These are diagnostic noise, not bugs.
-- `detector: sub-1s landing ignored …` — sub-second event rejected
-  by `MIN_FLIGHT_MS`.
+- `JUMP CANDIDATE airborneMs=… minG=… lowCount=…` — trigger accepted
+  on accelerometer evidence.
+- `CAND baro base=… nFl=… dip=… rate=… airMs=…` — per-candidate
+  barometric diagnostics at confirmation time.
+- `detector: discard candidate - <reason>` — candidate rejected by a
+  gate (noDip, noReturn, noSustained, fastDip, absurd, longFlight,
+  unstableBaseline, noBaseline, slowAtTakeoff). Diagnostic noise.
+- `JUMP LANDED ts=… durationMs=… heightM=…` + the follow-up line with
+  `airtimeS / lengthM / peakDeltaPa / baselinePa` — full jump metrics.
+- `SESSION_DUMP_START … JUMP_DUMP … SESSION_DUMP_END` — per-session
+  block, emitted on both the button stop and the BACK-exit paths.
+- `DISCARD_TALLY …` / `ACCEL_STATS …` / `BARO_STATS …` — one line
+  each at session end; they survive rotation long enough to read.
+- The FIT carries per-record `raw_pressure` and `accel_g` developer
+  fields for offline replay of any recorded jump.
 
 ### Syncing to Garmin Connect
 

@@ -792,10 +792,6 @@ function testShortJumpStillHasLength(logger as Test.Logger) as Boolean {
     return true;
 }
 
-// Jump length must not absorb the PENDING wait. _recordJump runs
-// PENDING_MS after the landing impact, and the old code measured to
-// getLatestPosition() - so fixes that keep arriving while the
-// candidate waits used to inflate every length by seconds of riding.
 (:test)
 function testLengthExcludesPendingLatency(logger as Test.Logger) as Boolean {
     var agg = new SensorAggregator();
@@ -832,5 +828,204 @@ function testLengthExcludesPendingLatency(logger as Test.Logger) as Boolean {
         return false;
     }
     logger.debug("testLengthExcludesPendingLatency: lengthM=" + lengthM);
+    return true;
+}
+
+// ---------------------------------------------------------------------
+// Gates from the 2026-10-10 false-jump field data
+// (docs/JUMP_DETECTION_ANALYSIS.md). Each replays the shape of a
+// recorded false event against the new validation order.
+// ---------------------------------------------------------------------
+
+// A late, fast pressure transient (the 14.9 m / 0.80 s false event):
+// flat pressure through the flight, then a ~180 Pa plunge inside the
+// last 0.8 s before landing. The dip rate gate must reject it - no
+// rider climbs 15 m in 0.8 s.
+(:test)
+function testFastTransientRejected(logger as Test.Logger) as Boolean {
+    var agg = new SensorAggregator();
+    var det = new JumpDetector(agg);
+
+    var landingTs = feedValidJumpAccelOnly(det, 2000, 1600);
+
+    agg.pushPressure(101325, -100);
+    agg.pushPressure(101325, 900);
+    agg.pushPressure(101325, 1900);
+    agg.pushPressure(101325, 3100);
+    agg.pushPressure(101145, 4200);
+    agg.pushPressure(101145, 4450);
+    agg.pushPressure(101325, landingTs + 600);
+    agg.pushPressure(101325, landingTs + 1000);
+    agg.pushPressure(101325, landingTs + 2000);
+
+    det.tick(landingTs + 3200);
+
+    var jump = det.getLastJump();
+    if (jump != null) {
+        logger.debug("testFastTransientRejected: transient recorded: " + jump);
+        return false;
+    }
+    logger.debug("testFastTransientRejected: fast transient rejected");
+    return true;
+}
+
+// A baseline window that wanders more than BASELINE_MAX_SPREAD_PA is
+// not a baseline: the pressure was already moving before takeoff.
+(:test)
+function testUnstableBaselineRejected(logger as Test.Logger) as Boolean {
+    var agg = new SensorAggregator();
+    var det = new JumpDetector(agg);
+
+    var landingTs = feedValidJumpAccelOnly(det, 2000, 1600);
+
+    agg.pushPressure(101325, -100);
+    agg.pushPressure(101450, 900);
+    agg.pushPressure(101290, landingTs + 600);
+    agg.pushPressure(101290, landingTs + 1000);
+
+    det.tick(landingTs + 3200);
+
+    var jump = det.getLastJump();
+    if (jump != null) {
+        logger.debug("testUnstableBaselineRejected: moving baseline recorded: " + jump);
+        return false;
+    }
+    logger.debug("testUnstableBaselineRejected: unstable baseline rejected");
+    return true;
+}
+
+// A dip too deep for its (clamped) airtime: 130 Pa in a 0.8 s window
+// passes the rate gate (162 Pa/s) but implies ~27 m/s mean vertical
+// speed, which no kite jump reaches.
+(:test)
+function testAbsurdKinematicsRejected(logger as Test.Logger) as Boolean {
+    var agg = new SensorAggregator();
+    var det = new JumpDetector(agg);
+
+    var landingTs = feedValidJumpAccelOnly(det, 2000, 1600);
+
+    agg.pushPressure(101325, -100);
+    agg.pushPressure(101325, 900);
+    agg.pushPressure(101195, 4200);
+    agg.pushPressure(101195, 4450);
+    agg.pushPressure(101325, landingTs + 600);
+    agg.pushPressure(101325, landingTs + 1000);
+    agg.pushPressure(101325, landingTs + 2000);
+
+    det.tick(landingTs + 3200);
+
+    var jump = det.getLastJump();
+    if (jump != null) {
+        logger.debug("testAbsurdKinematicsRejected: absurd kinematics recorded: " + jump);
+        return false;
+    }
+    logger.debug("testAbsurdKinematicsRejected: absurd height/airtime rejected");
+    return true;
+}
+
+// Back-to-back contamination (the 2026-10-10 burst pattern): candidate
+// one is discarded mid-decay, candidate two's accelerometer window
+// walks back across it, and without the previous-event clamp its dip
+// window absorbs the decay (a ~300 Pa false dip). The clamp must
+// starve candidate two of a baseline instead.
+(:test)
+function testPrevEventClampRejectsContamination(logger as Test.Logger) as Boolean {
+    var agg = new SensorAggregator();
+    var det = new JumpDetector(agg);
+
+    // Event 1: valid jump shape whose pressure never comes back (decay).
+    var landing1 = feedValidJumpAccelOnly(det, 2000, 1600);
+    agg.pushPressure(100000, -100);
+    agg.pushPressure(100000, 900);
+    agg.pushPressure(100000, 1900);
+    agg.pushPressure(99988, 3100);
+    agg.pushPressure(99960, 3700);
+    agg.pushPressure(99700, landing1 + 600);
+    agg.pushPressure(99700, landing1 + 1000);
+    agg.pushPressure(99700, landing1 + 1600);
+
+    // Event 2: quiet flight straight through event 1's windows, landing
+    // ~4 s later. Its accel window walks back across event 1's flight.
+    for (var t = 4700; t < 8500; t += 100) {
+        det.onAccelSample(0.0, 0.0, 7.35, t);
+    }
+    det.onAccelSample(0.0, 0.0, 21.57, 8500);
+    det.onAccelSample(0.0, 0.0, 21.57, 8600);
+
+    agg.pushPressure(100000, 9200);
+    agg.pushPressure(100000, 9800);
+    agg.pushPressure(100000, 10800);
+
+    det.tick(11800);
+
+    var jump = det.getLastJump();
+    if (jump != null) {
+        logger.debug("testPrevEventClampRejectsContamination: decay absorbed: " + jump);
+        return false;
+    }
+    logger.debug("testPrevEventClampRejectsContamination: contamination clamped");
+    return true;
+}
+
+// Airtime ceiling (2026-10-11 session, jumps 12/17/18/19): a 6.5 s
+// quiet flight whose pressure dip anchors at the flight start yields a
+// ~6.4 s "airtime" at a 2 m height. The window swallowed riding; the
+// candidate must be discarded on airtime alone.
+(:test)
+function testLongAirtimeDiscarded(logger as Test.Logger) as Boolean {
+    var agg = new SensorAggregator();
+    var det = new JumpDetector(agg);
+
+    var landingTs = feedValidJumpAccelOnly(det, 2000, 6500);
+
+    agg.pushPressure(101325, -100);
+    agg.pushPressure(101325, 900);
+    agg.pushPressure(101290, 3100);
+    agg.pushPressure(101290, 3700);
+    agg.pushPressure(101325, landingTs + 600);
+    agg.pushPressure(101325, landingTs + 1000);
+    agg.pushPressure(101325, landingTs + 2000);
+
+    det.tick(landingTs + 3200);
+
+    var jump = det.getLastJump();
+    if (jump != null) {
+        logger.debug("testLongAirtimeDiscarded: long window recorded: " + jump);
+        return false;
+    }
+    logger.debug("testLongAirtimeDiscarded: 6.4s airtime rejected");
+    return true;
+}
+
+// A jump just under the ceiling with a normal dip must still record:
+// the gate bounds the inflated windows, not real flight.
+(:test)
+function testAirtimeUnderCeilingRecords(logger as Test.Logger) as Boolean {
+    var agg = new SensorAggregator();
+    var det = new JumpDetector(agg);
+
+    var landingTs = feedValidJumpAccelOnly(det, 2000, 3000);
+
+    agg.pushPressure(101325, -100);
+    agg.pushPressure(101325, 900);
+    agg.pushPressure(101290, 3300);
+    agg.pushPressure(101290, 3800);
+    agg.pushPressure(101325, landingTs + 600);
+    agg.pushPressure(101325, landingTs + 1000);
+    agg.pushPressure(101325, landingTs + 2000);
+
+    det.tick(landingTs + 3200);
+
+    var jump = det.getLastJump();
+    if (jump == null) {
+        logger.debug("testAirtimeUnderCeilingRecords: 3s jump not recorded");
+        return false;
+    }
+    var airtimeS = jump[:airtimeS] as Float;
+    if (airtimeS == null || airtimeS > 4.5) {
+        logger.debug("testAirtimeUnderCeilingRecords: airtime=" + airtimeS);
+        return false;
+    }
+    logger.debug("testAirtimeUnderCeilingRecords: airtimeS=" + airtimeS.format("%.2f"));
     return true;
 }

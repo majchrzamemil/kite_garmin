@@ -30,4 +30,19 @@
               precision="1"
               dataLabel="@Strings.JumpAirtimeLabel"
               unitLabel="@Strings.SecondsUnit" />
+    <!-- Record-level telemetry (ids 3/4): raw barometer and total-G per
+         record, written from source/SessionManager.mc so false jumps
+         can be replayed offline. Not shown in lap views. -->
+    <fitField id="3"
+              displayInActivityLaps="false"
+              sortOrder="3"
+              precision="0"
+              dataLabel="@Strings.RawPressureLabel"
+              unitLabel="@Strings.PascalUnit" />
+    <fitField id="4"
+              displayInActivityLaps="false"
+              sortOrder="4"
+              precision="2"
+              dataLabel="@Strings.AccelGLabel"
+              unitLabel="@Strings.GUnit" />
 </fitContributions>

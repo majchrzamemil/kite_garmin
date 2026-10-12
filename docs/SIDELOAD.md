@@ -174,19 +174,26 @@ If the app does not appear, power cycle the watch:
 
 ### What to look for
 
-- `JUMP AIRBORNE ts=… takeoffG=… baselinePa=…` — takeoff event with
-  the trigger G and pre-jump pressure.
-- `detector: landing path=…` — which of the three landing paths
-  closed the jump (`pressure`, `gps`, or `lowG`).
-- `JUMP LANDED ts=… durationMs=… heightM=… airtimeS=…
-  landingPath=…` — full jump metrics.
-- `JUMP_DUMP idx=… heightM=… landingPath=… recorded=…` — per-jump
-  row inside the `SESSION_DUMP_*` block emitted by `App.endSession`.
-- `session: jump skipped (baro=…m airtime=…s)` — landed jump that
-  failed the 1.5 m / 1 s record gate and was not written to FIT.
-- `detector: discard no pressure drop …` / `detector: timeout
-  discard no pressure drop …` — candidate rejected by the 20 Pa
-  hybrid filter gate. These are diagnostic noise, not bugs.
+- `JUMP CANDIDATE airborneMs=… minG=… lowCount=…` — landing-spike
+  trigger accepted on accelerometer evidence; waiting for baro
+  confirmation.
+- `CAND baro base=… nFl=… dip=… rate=… airMs=…` — per-candidate
+  barometric diagnostics (baseline, flight samples, dip, rate,
+  airtime) at confirmation time.
+- `detector: discard candidate - <reason>` / `detector: discard - <reason>`
+  — candidate rejected by a gate (noDip, noReturn, noSustained,
+  fastDip, absurd, longFlight, unstableBaseline, noBaseline,
+  slowAtTakeoff, …). Diagnostic noise, not bugs.
+- `JUMP LANDED ts=… durationMs=… heightM=…` / the follow-up line with
+  `airtimeS=… lengthM=… peakDeltaPa=… baselinePa=…` — full jump
+  metrics.
+- `SESSION_DUMP_START … JUMP_DUMP … SESSION_DUMP_END` — per-session
+  block emitted by `App.endSession` and by `App.onStop` (BACK-exit).
+- `DISCARD_TALLY …` — one line at session end counting every gate's
+  rejections; `ACCEL_STATS` / `BARO_STATS` answer "is the feed real".
+- The FIT itself carries per-record `raw_pressure` (Pa) and `accel_g`
+  developer fields, so any jump can be replayed offline even after
+  this log has rotated.
 
 ### Case-sensitivity trap
 

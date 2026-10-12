@@ -35,12 +35,19 @@ class SessionManager {
     static const FIELD_HEIGHT       = 0;
     static const FIELD_LENGTH       = 1;
     static const FIELD_AIRTIME      = 2;
+    // Record-level telemetry fields (ids 3/4): raw barometer and total-G
+    // land in the FIT so false jumps can be replayed offline. The FIT
+    // survives APP.TXT rotation; the text log does not.
+    static const FIELD_PRESSURE     = 3;
+    static const FIELD_ACCEL_G      = 4;
 
     var _state        as Number;
     var _session      as ActivityRecording.Session?;
     var _heightField  as FitContributor.Field?;
     var _lengthField  as FitContributor.Field?;
     var _airtimeField as FitContributor.Field?;
+    var _pressureField as FitContributor.Field?;
+    var _accelGField  as FitContributor.Field?;
     var _jumpCount    as Number;
     // Jumps the recorder itself refused (corrupt height). Reported on
     // the session-end DISCARD_TALLY line so a detector rejection and a
@@ -53,6 +60,8 @@ class SessionManager {
         _heightField  = null;
         _lengthField  = null;
         _airtimeField = null;
+        _pressureField = null;
+        _accelGField  = null;
         _jumpCount    = 0;
         _skippedSanity    = 0;
     }
@@ -147,7 +156,26 @@ class SessionManager {
             FitContributor.DATA_TYPE_FLOAT,
             { :mesgType => FitContributor.MESG_TYPE_LAP, :units => "s" }
         );
-        Logger.info("SessionManager.startSession: after createField (all three)");
+        // Record-level telemetry (optional: a failure here must not
+        // cost the session, the lap fields above are the product).
+        Logger.info("SessionManager.startSession: before createField(pressure)");
+        _pressureField = session.createField(
+            "raw_pressure",
+            FIELD_PRESSURE,
+            FitContributor.DATA_TYPE_FLOAT,
+            { :mesgType => FitContributor.MESG_TYPE_RECORD, :units => "Pa" }
+        );
+        Logger.info("SessionManager.startSession: before createField(accelG)");
+        _accelGField = session.createField(
+            "accel_g",
+            FIELD_ACCEL_G,
+            FitContributor.DATA_TYPE_FLOAT,
+            { :mesgType => FitContributor.MESG_TYPE_RECORD, :units => "G" }
+        );
+        if (_pressureField == null || _accelGField == null) {
+            Logger.warn("session: record telemetry fields unavailable");
+        }
+        Logger.info("SessionManager.startSession: after createField (all)");
         if (hField == null || lField == null || aField == null) {
             Logger.error("session: createField returned null for one or more lap fields");
             session.discard();
@@ -195,6 +223,16 @@ class SessionManager {
         _state = STATE_STOPPING;
 
         var session = _session;
+        // The trailing lap Garmin auto-closes at stop() inherits the last
+        // setData values, which duplicated the final jump in the FIT.
+        // Zero them so the trailing lap reads as "no jump".
+        try {
+            if (_heightField != null) { _heightField.setData(0.0); }
+            if (_lengthField != null) { _lengthField.setData(0.0); }
+            if (_airtimeField != null) { _airtimeField.setData(0.0); }
+        } catch (eZero) {
+            Logger.warn("stopSession: zeroing lap fields failed e=" + eZero);
+        }
         Logger.info("SessionManager.stopSession: before session.stop()");
         var stopped = session.stop();
         Logger.info("SessionManager.stopSession: after session.stop() -> " + stopped);
@@ -207,6 +245,8 @@ class SessionManager {
         _heightField  = null;
         _lengthField  = null;
         _airtimeField = null;
+        _pressureField = null;
+        _accelGField  = null;
 
         if (!stopped || !saved) {
             _state = STATE_IDLE;
@@ -226,6 +266,24 @@ class SessionManager {
     // all three custom fields BEFORE addLap() so the values are
     // captured with the lap boundary. Returns the result of addLap().
     // ------------------------------------------------------------------
+
+    // Record-level telemetry. Called from the sensor callbacks at their
+    // own cadence; the session snapshots the pending values into each
+    // record it writes. Cheap no-ops when the fields are unavailable.
+
+    function setRecordPressure(pa as Number) as Void {
+        var f = _pressureField;
+        if (f != null) {
+            try { f.setData(pa); } catch (e) { _pressureField = null; }
+        }
+    }
+
+    function setRecordAccelG(g as Float) as Void {
+        var f = _accelGField;
+        if (f != null) {
+            try { f.setData(g); } catch (e) { _accelGField = null; }
+        }
+    }
 
     function addJumpLap(jump as Dictionary) as Boolean {
         Logger.info("SessionManager.addJumpLap: entered (state=" + getStateName() + ")");

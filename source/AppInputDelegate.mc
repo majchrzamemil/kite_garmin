@@ -21,12 +21,22 @@ class AppInputDelegate extends WatchUi.InputDelegate {
 
     function onKey(evt as WatchUi.KeyEvent) as Boolean {
         var key = evt.getKey();
-        if ((key == WatchUi.KEY_START || key == WatchUi.KEY_ENTER) && evt.getType() == WatchUi.PRESS_TYPE_ACTION) {
+        if (evt.getType() != WatchUi.PRESS_TYPE_ACTION) {
+            return false;
+        }
+        if (key == WatchUi.KEY_START || key == WatchUi.KEY_ENTER) {
             if (_app.isRecording()) {
                 _app.endSession();
             } else {
                 _app.beginSession();
             }
+            return true;
+        }
+        // Review the last session from the start screen. BACK-exits
+        // cannot show the review at stop time, so it waits here.
+        if ((key == WatchUi.KEY_UP || key == WatchUi.KEY_DOWN)
+                && !_app.isRecording() && _app.hasLastSession()) {
+            _app.showLastSessionReview();
             return true;
         }
         return false;

@@ -35,6 +35,17 @@ class App extends Application.AppBase {
     // is written against.
     static const ACCEL_RATE_HZ = 25;
 
+    // Storage keys for the most recent session summary. Written by
+    // _dumpSession() on both stop paths (button stop and app exit) so
+    // the review survives a BACK-exit, which cannot push a view.
+    // Application.Storage values are primitives or arrays of
+    // primitives, hence one key per series.
+    static const STORAGE_LAST_AIRTIME = "lastAirtime";
+    static const STORAGE_LAST_COUNT   = "lastCount";
+    static const STORAGE_LAST_H       = "lastH";
+    static const STORAGE_LAST_L       = "lastL";
+    static const STORAGE_LAST_T       = "lastT";
+
     // Pressure poll period. The barometer's true update rate is unknown
     // and was never measured, so we poll faster than 1 Hz and store only
     // changed readings: if the sensor really is 1 Hz we get the same
@@ -128,12 +139,19 @@ class App extends Application.AppBase {
 
     // onStop fires when the user exits the app. If a session is still
     // recording, close it (and therefore the FIT file) before tearing
-    // down the sensor pipeline so we do not lose the activity.
+    // down the sensor pipeline so we do not lose the activity. The
+    // user's habit is to quit via BACK (see docs/SIDELOAD.md), and no
+    // view can be pushed while exiting - so the session block is
+    // dumped to the log and persisted to storage for review on the
+    // next launch instead of switching to SessionReviewView here.
 
     function onStop(state) {
         if (_sessionManager.isRecording()) {
             Logger.info("onStop: active session, stopping before pipeline teardown");
             _sessionManager.stopSession();
+            Logger.info("App.onStop: before _dumpSession");
+            _dumpSession();
+            Logger.info("App.onStop: after _dumpSession");
         }
         stopSensorPipeline();
     }
@@ -143,7 +161,7 @@ class App extends Application.AppBase {
 
     function getInitialView() {
         Logger.info("App.getInitialView: returning StartView");
-        return [ new StartView(), new AppInputDelegate(self) ];
+        return [ new StartView(self), new AppInputDelegate(self) ];
     }
 
     // ------------------------------------------------------------------
@@ -283,15 +301,18 @@ class App extends Application.AppBase {
         if (n == 0 || ys.size() < n || zs.size() < n) { return; }
 
         var now = System.getTimer();
+        var gLast = 0.0f;
         for (var i = 0; i < n; i++) {
             var when = batchSampleTime(now, n, i, _accelRateHz);
             var x = xs[i].toFloat() * 9.80665 / 1000.0;
             var y = ys[i].toFloat() * 9.80665 / 1000.0;
             var z = zs[i].toFloat() * 9.80665 / 1000.0;
+            gLast = Math.sqrt(x * x + y * y + z * z) / 9.80665;
             _aggregator.pushAccel(x, y, z, when);
             _detector.onAccelSample(x, y, z, when);
             _accumAccelStats(x, y, z);
         }
+        _sessionManager.setRecordAccelG(gLast);
 
         // Once per batch, not once per sample: COAST_MS (1500 ms) is
         // longer than the 1 s batch, so at most one jump can complete
@@ -315,6 +336,8 @@ class App extends Application.AppBase {
                 var x = a[0].toFloat() * 9.80665 / 1000.0;
                 var y = a[1].toFloat() * 9.80665 / 1000.0;
                 var z = a[2].toFloat() * 9.80665 / 1000.0;
+                _sessionManager.setRecordAccelG(
+                    Math.sqrt(x * x + y * y + z * z) / 9.80665);
                 var when = System.getTimer();
                 _aggregator.pushAccel(x, y, z, when);
                 _detector.onAccelSample(x, y, z, when);
@@ -346,6 +369,7 @@ class App extends Application.AppBase {
         if (rawPa != null) {
             var pa = rawPa.toNumber();
             _paPolls++;
+            _sessionManager.setRecordPressure(pa);
             // Store only changed readings. Polling a 1 Hz sensor at 4 Hz
             // would otherwise write four copies of each value, and the
             // detector's "second-lowest flight sample" splash guard
@@ -771,6 +795,11 @@ class App extends Application.AppBase {
             + " noDip=" + dc[JumpDetector.DISCARD_NO_DIP]
             + " noReturn=" + dc[JumpDetector.DISCARD_NO_RETURN]
             + " slowAtTakeoff=" + dc[JumpDetector.DISCARD_SLOW_TAKEOFF]
+            + " unstableBaseline=" + dc[JumpDetector.DISCARD_UNSTABLE_BASELINE]
+            + " noSustained=" + dc[JumpDetector.DISCARD_NO_SUSTAIN]
+            + " fastDip=" + dc[JumpDetector.DISCARD_FAST_DIP]
+            + " absurd=" + dc[JumpDetector.DISCARD_ABSURD_KINEMATICS]
+            + " longFlight=" + dc[JumpDetector.DISCARD_LONG_FLIGHT]
             + " skippedSanity=" + _sessionManager.getSkippedSanity()
         );
 
@@ -781,6 +810,106 @@ class App extends Application.AppBase {
             + " totalAirtimeS=" + totalAirtimeS.format("%.2f")
             + " sessionDurationMs=" + sessionDurationMs
         );
+
+        _persistLastSession(recordedCount, totalAirtimeS);
+    }
+
+    // ------------------------------------------------------------------
+    // Last-session summary in Application.Storage
+    //
+    // Quitting via BACK while recording saves the FIT but cannot show
+    // SessionReviewView (the app is exiting). Persist the summary here
+    // on every stop path; the start screen offers to review it on the
+    // next launch.
+    // ------------------------------------------------------------------
+
+    function _persistLastSession(recordedCount as Number, totalAirtimeS as Float) as Void {
+        try {
+            // Only recorded jumps are kept: the review view filters to
+            // those anyway.
+            var hs = [] as Array<Float>;
+            var ls = [] as Array<Float>;
+            var ts = [] as Array<Number>;
+            var i = 0;
+            while (i < _sessionJumps.size()) {
+                var j = _sessionJumps[i];
+                var rec = j.get(:recorded);
+                if (rec != null && (rec as Boolean)) {
+                    var hM = j.get(:heightM);
+                    var lM = j.get(:lengthM);
+                    var tM = j.get(:durationMs);
+                    if (hM == null) { hM = 0; }
+                    if (lM == null) { lM = 0; }
+                    if (tM == null) { tM = 0; }
+                    hs.add(hM.toFloat());
+                    ls.add(lM.toFloat());
+                    ts.add(tM.toNumber());
+                }
+                i++;
+            }
+            Application.Storage.setValue(STORAGE_LAST_AIRTIME, totalAirtimeS);
+            Application.Storage.setValue(STORAGE_LAST_COUNT, recordedCount);
+            Application.Storage.setValue(STORAGE_LAST_H, hs);
+            Application.Storage.setValue(STORAGE_LAST_L, ls);
+            Application.Storage.setValue(STORAGE_LAST_T, ts);
+            Logger.info("session: summary persisted (jumps=" + hs.size() + ")");
+        } catch (e) {
+            Logger.warn("session: summary persist failed e=" + e);
+        }
+    }
+
+    function hasLastSession() as Boolean {
+        return Application.Storage.getValue(STORAGE_LAST_COUNT) != null;
+    }
+
+    // One-line summary for the start screen, or null when no session
+    // has been stored yet.
+
+    function getLastSessionLine() as String? {
+        var count = Application.Storage.getValue(STORAGE_LAST_COUNT) as Number;
+        if (count == null) {
+            return null;
+        }
+        var airtimeS = Application.Storage.getValue(STORAGE_LAST_AIRTIME) as Float;
+        if (airtimeS == null) { airtimeS = 0.0f; }
+        return "Last: " + count + " jumps "
+            + airtimeS.format("%.0f") + "s air";
+    }
+
+    // Called from AppInputDelegate (UP/DOWN on the start screen) to
+    // review the stored session summary.
+
+    function showLastSessionReview() as Void {
+        var count = Application.Storage.getValue(STORAGE_LAST_COUNT) as Number;
+        if (count == null) {
+            Logger.warn("ui: no stored session to review");
+            return;
+        }
+        var airtimeS = Application.Storage.getValue(STORAGE_LAST_AIRTIME) as Float;
+        if (airtimeS == null) { airtimeS = 0.0f; }
+        var hs = Application.Storage.getValue(STORAGE_LAST_H) as Array<Float>;
+        var ls = Application.Storage.getValue(STORAGE_LAST_L) as Array<Float>;
+        var ts = Application.Storage.getValue(STORAGE_LAST_T) as Array<Number>;
+
+        var jumps = [] as Array<Dictionary>;
+        var i = 0;
+        var n = hs != null ? hs.size() : 0;
+        while (i < n) {
+            jumps.add({
+                :heightM    => hs[i],
+                :lengthM    => ls != null ? ls[i] : 0.0f,
+                :durationMs => ts != null ? ts[i] : 0,
+                :recorded   => true
+            });
+            i++;
+        }
+        var reviewView = new SessionReviewView(jumps, airtimeS, count);
+        WatchUi.switchToView(
+            reviewView,
+            new SessionReviewInputDelegate(reviewView),
+            WatchUi.SLIDE_IMMEDIATE
+        );
+        Logger.info("ui: switched to last-session review (jumps=" + count + ")");
     }
 }
 
